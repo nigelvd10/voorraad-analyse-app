@@ -1,20 +1,19 @@
-# app.py — met ingebouwde login (Nigel / G&N2k25)
+# app.py — Login vast in code (Nigel / G&N2k25) + app
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-import sqlite3, os, re
+import sqlite3, os, re, unicodedata
 from datetime import date, timedelta
 
-# =============== INLOG-INSTELLINGEN (direct in code) ===============
-AUTH_USERS = {
-    "Nigel": "G&N2k25",   # << jouw inlog
-}
+# ================== LOGIN-INSTELLINGEN ==================
 APP_TITLE = "Voorraad App (secure)"
+# Toegestane accounts: {lowercase_username: exact_password}
+AUTH_USERS = {"nigel": "G&N2k25"}  # << HIER NIET WIJZIGEN TZIJDAT JE EEN ANDERE LOGIN WILT
 
 # ================== APP-SETUP & STYLES ==================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
-SIDEBAR_CSS = """
+st.markdown("""
 <style>
 section[data-testid="stSidebar"] {background:#201915;color:#fff;}
 .sidebar-title {font-size:28px;font-weight:700;margin:8px 0 16px 4px;color:#fff;}
@@ -22,23 +21,33 @@ section[data-testid="stSidebar"] {background:#201915;color:#fff;}
 .nav-btn:hover {background:rgba(255,255,255,.06);}
 .nav-active {background:#3a2f27;color:#fff;}
 </style>
-"""
-st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# ================== AUTH (in-code) ==================
+# ================== AUTH ==================
+def _normalize(s: str) -> str:
+    # strip spaties, normaliseer unicode (NFC), verwijder onzichtbare whitespace
+    s = (s or "")
+    s = unicodedata.normalize("NFC", s)
+    s = s.replace("\u200b", "").replace("\u200e", "").replace("\u200f", "")  # zero-width en RTL marks
+    return s.strip()
+
 def login_screen():
     st.title("🔐 Inloggen")
     u = st.text_input("Gebruikersnaam")
-    p = st.text_input("Wachtwoord", type="password")
+    show = st.checkbox("Toon wachtwoord", value=False)
+    p = st.text_input("Wachtwoord", type=("text" if show else "password"))
     if st.button("Inloggen", type="primary"):
-        u_clean = (u or "").strip()
-        p_clean = (p or "").strip()
-        if u_clean in AUTH_USERS and p_clean == str(AUTH_USERS[u_clean]):
+        u_norm = _normalize(u).lower()      # gebruikersnaam case-insensitive
+        p_norm = _normalize(p)              # wachtwoord exact, maar zonder per ongeluk spaties
+        ok = (u_norm in AUTH_USERS) and (p_norm == AUTH_USERS[u_norm])
+        if ok:
             st.session_state["auth_ok"] = True
-            st.session_state["auth_user"] = u_clean
+            st.session_state["auth_user"] = u_norm
             st.experimental_rerun()
         else:
+            # Kleine debug-hint om te zien of & en lengte kloppen
             st.error("Onjuiste inloggegevens.")
+            st.caption(f"🧩 Debug-hint: gebruikersnaam='{_normalize(u)}' (lower='{u_norm}'), wachtwoord-lengte={len(p_norm)}")
 
 def require_login():
     if not st.session_state.get("auth_ok"):
@@ -47,7 +56,7 @@ def require_login():
 
 require_login()
 
-# Logout in sidebar
+# Logout
 with st.sidebar:
     st.write(f"👤 Ingelogd als **{st.session_state.get('auth_user','?')}**")
     if st.button("🚪 Uitloggen", use_container_width=True):
@@ -346,7 +355,7 @@ def recommend(row):
     moq = to_int(row.get("MOQ",1),1)
     return int(np.ceil(need/max(1,moq))*max(1,moq))
 
-# ================== SIDEBAR NAV ==================
+# ================== NAVIGATION ==================
 with st.sidebar:
     st.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
     pages = ["Home", "Inventory", "Suppliers", "Incoming"]
@@ -376,7 +385,6 @@ if choice == "Home":
     c3.metric("Out of stock", int((inv["Status"]=="Out of stock").sum()))
     c4.metric("At risk", int((inv["Status"]=="At risk").sum()))
 
-    # Staafdiagram (vaste kleuren)
     st.markdown("**Voorraad gezondheid**")
     order = ["Out of stock","At risk","Healthy","Overstock"]
     counts = inv["Status"].value_counts().reindex(order).fillna(0)
