@@ -1,4 +1,4 @@
-# app.py — met login-beveiliging
+# app.py — met ingebouwde login (Nigel / G&N2k25)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,11 +6,14 @@ import altair as alt
 import sqlite3, os, re
 from datetime import date, timedelta
 
-# =============================
-# App setup & styles
-# =============================
-st.set_page_config(page_title="Voorraad App (secure)", layout="wide")
+# =============== INLOG-INSTELLINGEN (direct in code) ===============
+AUTH_USERS = {
+    "Nigel": "G&N2k25",   # << jouw inlog
+}
+APP_TITLE = "Voorraad App (secure)"
 
+# ================== APP-SETUP & STYLES ==================
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 SIDEBAR_CSS = """
 <style>
 section[data-testid="stSidebar"] {background:#201915;color:#fff;}
@@ -22,55 +25,37 @@ section[data-testid="stSidebar"] {background:#201915;color:#fff;}
 """
 st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
-# =============================
-# Auth: eenvoudige login
-# =============================
-def _get_auth_lists():
-    try:
-        users = list(st.secrets["auth"]["users"])
-        pwds  = list(st.secrets["auth"]["passwords"])
-        assert len(users) == len(pwds) and len(users) > 0
-        return users, pwds
-    except Exception:
-        # vangt verkeerd geconfigureerde secrets af
-        return ["admin"], ["changeme"]
-
+# ================== AUTH (in-code) ==================
 def login_screen():
-    st.title("🔐 Voorraad App – Inloggen")
-    st.caption("Voer je gebruikersnaam en wachtwoord in om verder te gaan.")
+    st.title("🔐 Inloggen")
     u = st.text_input("Gebruikersnaam")
     p = st.text_input("Wachtwoord", type="password")
-    col1, col2 = st.columns([1,3])
-    ok = col1.button("Inloggen", type="primary")
-    if ok:
-        users, pwds = _get_auth_lists()
-        if u in users:
-            idx = users.index(u)
-            if p == pwds[idx]:
-                st.session_state["auth_ok"] = True
-                st.session_state["auth_user"] = u
-                st.experimental_rerun()
-        st.error("Onjuiste inloggegevens.")
+    if st.button("Inloggen", type="primary"):
+        u_clean = (u or "").strip()
+        p_clean = (p or "").strip()
+        if u_clean in AUTH_USERS and p_clean == str(AUTH_USERS[u_clean]):
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_user"] = u_clean
+            st.experimental_rerun()
+        else:
+            st.error("Onjuiste inloggegevens.")
 
 def require_login():
     if not st.session_state.get("auth_ok"):
         login_screen()
         st.stop()
 
-# ====== Pas vanaf hier is de app zichtbaar ======
 require_login()
 
-# Logout knopje in de sidebar
+# Logout in sidebar
 with st.sidebar:
-    st.write(f"👤 Ingelogd als **{st.session_state.get('auth_user','onbekend')}**")
+    st.write(f"👤 Ingelogd als **{st.session_state.get('auth_user','?')}**")
     if st.button("🚪 Uitloggen", use_container_width=True):
-        for k in ["auth_ok", "auth_user"]:
+        for k in ["auth_ok","auth_user","_page"]:
             st.session_state.pop(k, None)
         st.experimental_rerun()
 
-# =============================
-# Helpers
-# =============================
+# ================== HELPERS ==================
 def to_num(x):
     return pd.to_numeric(pd.Series(x).astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
@@ -119,15 +104,12 @@ def build_base(df_raw, sel):
     })
     return df[REQ_ORDER]
 
-# =============================
-# SQLite opslag
-# =============================
+# ================== SQLite OPSLAG ==================
 DB_PATH = os.path.join(os.getcwd(), "app_data.db")
 def db(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
     c = db(); cur = c.cursor()
-    # prices
     cur.execute("""
     CREATE TABLE IF NOT EXISTS prices (
         EAN TEXT PRIMARY KEY,
@@ -140,7 +122,6 @@ def init_db():
         MOQ INTEGER DEFAULT 1,
         Levertijd_dagen INTEGER DEFAULT 0
     )""")
-    # suppliers (uitgebreid) + migratie
     cur.execute("""
     CREATE TABLE IF NOT EXISTS suppliers (
         Naam TEXT PRIMARY KEY,
@@ -160,7 +141,7 @@ def init_db():
         Opmerking TEXT DEFAULT ''
     )""")
     c.commit()
-    # migratie kolommen (als oude DB zonder nieuwe kolommen)
+    # migratie kolommen
     cur.execute("PRAGMA table_info(suppliers)")
     cols = {row[1] for row in cur.fetchall()}
     if "Productietijd_dagen" not in cols:
@@ -281,9 +262,7 @@ def delete_incoming_row(row_id: int):
     c.commit(); c.close()
     st.cache_data.clear()
 
-# =============================
-# Basisdata upload (optioneel – tot bol-API live is)
-# =============================
+# ================== BASISDATA UPLOAD (tijdelijk) ==================
 if "base_df" not in st.session_state:
     st.session_state.base_df = None
 
@@ -315,9 +294,7 @@ def upload_base_ui():
         except Exception as e:
             st.error(f"Kon Excel niet lezen: {e}")
 
-# =============================
-# Merge helper
-# =============================
+# ================== MERGE HELPER ==================
 def merged_inventory():
     base = st.session_state.base_df
     if base is None: return None
@@ -349,9 +326,7 @@ def merged_inventory():
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
     return base
 
-# =============================
-# Benchmarks + recommend
-# =============================
+# ================== BENCHMARKS ==================
 def classify(row, over_pct):
     f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
     stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
@@ -371,9 +346,7 @@ def recommend(row):
     moq = to_int(row.get("MOQ",1),1)
     return int(np.ceil(need/max(1,moq))*max(1,moq))
 
-# =============================
-# Sidebar navigatie
-# =============================
+# ================== SIDEBAR NAV ==================
 with st.sidebar:
     st.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
     pages = ["Home", "Inventory", "Suppliers", "Incoming"]
@@ -385,13 +358,11 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
-# =============================
-# Pagina's
-# =============================
+# ================== PAGES ==================
 if choice == "Home":
     st.header("Home")
     if st.session_state.base_df is None:
-        st.info("Nog geen basisdata geladen. Upload hieronder (tijdelijk – tot bol-API live is).")
+        st.info("Nog geen basisdata geladen. Upload hieronder (tijdelijk, tot API-koppeling).")
         upload_base_ui()
     inv = merged_inventory()
     if inv is None: st.stop()
@@ -405,6 +376,7 @@ if choice == "Home":
     c3.metric("Out of stock", int((inv["Status"]=="Out of stock").sum()))
     c4.metric("At risk", int((inv["Status"]=="At risk").sum()))
 
+    # Staafdiagram (vaste kleuren)
     st.markdown("**Voorraad gezondheid**")
     order = ["Out of stock","At risk","Healthy","Overstock"]
     counts = inv["Status"].value_counts().reindex(order).fillna(0)
@@ -493,9 +465,7 @@ elif choice == "Suppliers":
         del_name = st.selectbox("🗑️ Verwijderen: kies leverancier", ["—"] + sup_edit["Naam"].astype(str).tolist())
         if st.button("Verwijder geselecteerde"):
             if del_name and del_name != "—":
-                # verwijder in DB + ververst cache
-                c=db(); cur=c.cursor(); cur.execute("DELETE FROM suppliers WHERE Naam=?", (del_name,)); c.commit(); c.close()
-                st.success(f"'{del_name}' verwijderd."); st.cache_data.clear(); st.experimental_rerun()
+                delete_supplier(del_name); st.success(f"'{del_name}' verwijderd."); st.cache_data.clear(); st.experimental_rerun()
 
 elif choice == "Incoming":
     st.header("Incoming")
