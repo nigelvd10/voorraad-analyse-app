@@ -1,4 +1,4 @@
-# app.py — zonder login, met Referentie uit upload + merge-voorrang
+# app.py — Referentie gegarandeerd te kiezen/overnemen
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -35,10 +35,28 @@ def to_int(x, default=0):
     except Exception:
         return default
 
-# Kolomherkenning incl. Referentie
+# --- Kolomherkenning (geüpdatet) ---
 PATTERNS = {
-    "ean": [r"^\s*ean\s*$", r"\bgtin\b", r"product\s*code", r"art(ikel)?\s*(nr|nummer)?"],
-    "ref": [r"^\s*referentie\s*$", r"^ref$", r"\breference\b", r"\bsku\b", r"artikel\s*code", r"product\s*code"],
+    # EAN: bewust stricter, zodat hij niet een "product code" pakt
+    "ean": [
+        r"^\s*ean\s*$",
+        r"\bgtin\b",
+        r"^\s*barcode\s*$",
+        r"^\s*upc\s*$",
+    ],
+    # Referentie: veel gebruikte namen
+    "ref": [
+        r"^\s*referentie\s*$",
+        r"^ref$",
+        r"\breference\b",
+        r"^\s*sku\s*$",
+        r"artikel\s*code",
+        r"artikel\s*nr",
+        r"artikelnummer",
+        r"product\s*ref(erentie)?",
+        r"vendor\s*code",
+        r"model\s*code",
+    ],
     "title": [r"^\s*titel\s*$", r"^\s*naam\s*$", r"product\s*naam", r"title"],
     "stock": [r"vrije\s*voorraad", r"\bvoorraad\b", r"available", r"stock"],
     "sales_total": [r"verkopen\s*\(\s*totaal\s*\)", r"verkopen.*totaal", r"totaal.*verkopen", r"sales\s*total"],
@@ -66,12 +84,8 @@ def read_excel_all(file):
     return out
 
 def build_base(df_raw, sel):
-    # Referentie optioneel
-    ref_col = sel.get("ref", "— (leeg laten) —")
-    if ref_col and ref_col not in ["— kies —", "— (leeg laten) —"]:
-        ref_series = df_raw[ref_col].astype(str)
-    else:
-        ref_series = ""
+    ref_col = sel.get("ref")
+    ref_series = df_raw[ref_col].astype(str) if ref_col else ""
     df = pd.DataFrame({
         "EAN": df_raw[sel["ean"]].astype(str).str.strip(),
         "Referentie": ref_series,
@@ -90,7 +104,6 @@ def db(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
     c = db(); cur = c.cursor()
-    # prices
     cur.execute("""
     CREATE TABLE IF NOT EXISTS prices (
         EAN TEXT PRIMARY KEY,
@@ -103,7 +116,6 @@ def init_db():
         MOQ INTEGER DEFAULT 1,
         Levertijd_dagen INTEGER DEFAULT 0
     )""")
-    # suppliers (uitgebreid)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS suppliers (
         Naam TEXT PRIMARY KEY,
@@ -112,7 +124,6 @@ def init_db():
         Levertijd_zee_dagen INTEGER DEFAULT 0,
         Levertijd_lucht_dagen INTEGER DEFAULT 0
     )""")
-    # incoming
     cur.execute("""
     CREATE TABLE IF NOT EXISTS incoming (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,7 +135,6 @@ def init_db():
         Opmerking TEXT DEFAULT ''
     )""")
     c.commit()
-    # MIGRATIE suppliers (voeg ontbrekende kolommen toe)
     cur.execute("PRAGMA table_info(suppliers)")
     cols = {row[1] for row in cur.fetchall()}
     if "Productietijd_dagen" not in cols:
@@ -135,7 +145,6 @@ def init_db():
         cur.execute("ALTER TABLE suppliers ADD COLUMN Levertijd_lucht_dagen INTEGER DEFAULT 0")
     c.commit(); c.close()
 
-# ---- prijzen
 @st.cache_data(show_spinner=False)
 def load_prices():
     init_db()
@@ -165,7 +174,6 @@ def save_prices(df):
     df["Referentie"]=df["Referentie"].astype(str).str.strip()
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         df[c]=pd.to_numeric(df[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
-
     c=db(); cur=c.cursor()
     cur.execute("DELETE FROM prices")
     cur.executemany("""
@@ -181,7 +189,6 @@ def save_prices(df):
     c.commit(); c.close()
     st.cache_data.clear()
 
-# ---- suppliers
 @st.cache_data(show_spinner=False)
 def load_suppliers():
     init_db()
@@ -207,7 +214,6 @@ def save_suppliers(df):
     df["Locatie"]=df["Locatie"].astype(str).str.strip()
     for col in ["Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"]:
         df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
     c=db(); cur=c.cursor()
     cur.execute("DELETE FROM suppliers")
     cur.executemany(
@@ -224,7 +230,6 @@ def delete_supplier(name: str):
     c.commit(); c.close()
     st.cache_data.clear()
 
-# ---- incoming
 @st.cache_data(show_spinner=False)
 def load_incoming():
     init_db()
@@ -267,25 +272,31 @@ def upload_base_ui():
 
             auto = auto_map(raw)
 
+            # Keuze EAN/Titel/Vrij/Verkopen/Forecast verplicht, Referentie aanbevolen
             def pick(lbl, key, optional=False):
-                opts = (["— (leeg laten) —"] if optional else []) + ["— kies —"] + list(raw.columns)
+                opts = (["— (geen) —"] if optional else []) + list(raw.columns)
+                # automatisch voorstel
                 default = auto.get(key)
-                if default and default in raw.columns:
-                    idx = (1 if optional else 0) + 1 + list(raw.columns).index(default)
-                else:
-                    idx = 0 if optional else 0
+                idx = (opts.index(default) if default in opts else 0)
                 return st.selectbox(lbl, opts, index=idx)
 
             sel = {
-                "ean": pick("Kolom voor EAN","ean"),
-                "ref": pick("Kolom voor Referentie (optioneel)","ref", optional=True),
-                "title": pick("Kolom voor Titel","title"),
-                "stock": pick("Kolom voor Vrije voorraad","stock"),
-                "sales_total": pick("Kolom voor Verkopen (Totaal)","sales_total"),
-                "forecast_min_4w": pick("Kolom voor Verkoopprognose min (Totaal 4w)","forecast_min_4w"),
+                "ean": pick("Kolom voor EAN *","ean"),
+                "ref": pick("Kolom voor Referentie (aanbevolen)","ref", optional=True),
+                "title": pick("Kolom voor Titel *","title"),
+                "stock": pick("Kolom voor Vrije voorraad *","stock"),
+                "sales_total": pick("Kolom voor Verkopen (Totaal) *","sales_total"),
+                "forecast_min_4w": pick("Kolom voor Verkoopprognose min (Totaal 4w) *","forecast_min_4w"),
             }
-            ok = all(sel[k] != "— kies —" for k in ["ean","title","stock","sales_total","forecast_min_4w"])
+
+            # validatie
+            mandatory = ["ean","title","stock","sales_total","forecast_min_4w"]
+            ok = all(sel[k] not in ["— (geen) —"] for k in mandatory)
+
             if st.button("✅ Vastleggen", type="primary", disabled=not ok):
+                # als Referentie niet gekozen is, zet None
+                if sel["ref"] == "— (geen) —":
+                    sel["ref"] = None
                 st.session_state.base_df = build_base(raw, sel)
                 st.success("Basisdata opgeslagen.")
         except Exception as e:
@@ -322,10 +333,11 @@ def merged_inventory():
             how="left",
             suffixes=("_u", "_p")
         )
-        # Referentie uit upload (…_u) krijgt voorrang; zo niet, dan uit prices (…_p)
+        # Referentie: upload (…_u) > prices (…_p)
         if "Referentie_u" in base.columns or "Referentie_p" in base.columns:
-            base["Referentie"] = base.get("Referentie_u", "").replace("", np.nan).fillna(base.get("Referentie_p", ""))
-            base.drop(columns=[c for c in ["Referentie_u","Referentie_p"] if c in base.columns], inplace=True, errors="ignore")
+            base["Referentie"] = base.get("Referentie_u","").replace("", np.nan).fillna(base.get("Referentie_p",""))
+            base.drop(columns=[c for c in ["Referentie_u","Referentie_p"] if c in base.columns],
+                     inplace=True, errors="ignore")
     else:
         for c in cols:
             if c not in base.columns: base[c] = 0 if c not in ["Leverancier","Referentie"] else ""
@@ -383,7 +395,7 @@ with st.sidebar:
 if choice == "Home":
     st.header("Home")
     if st.session_state.base_df is None:
-        st.info("Nog geen basisdata geladen. Upload hieronder.")
+        st.info("Nog geen basisdata geladen. Upload hieronder. **Kies ook de kolom 'Referentie' als die in je bestand staat.**")
         upload_base_ui()
     inv = merged_inventory()
     if inv is None: st.stop()
@@ -416,7 +428,7 @@ if choice == "Home":
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # Klikbare "chips" (betrouwbare workaround voor chart-click) voor details
+    # Klikbare chips voor details
     st.markdown("**Klik op een categorie voor details**")
     cols = st.columns(4)
     selected = st.session_state.get("selected_status", None)
