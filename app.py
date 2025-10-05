@@ -1,4 +1,4 @@
-# app.py — Referentie gegarandeerd te kiezen/overnemen
+# app.py — Overstock op absolute drempel (stuks)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -35,16 +35,14 @@ def to_int(x, default=0):
     except Exception:
         return default
 
-# --- Kolomherkenning (geüpdatet) ---
+# Kolomherkenning incl. Referentie
 PATTERNS = {
-    # EAN: bewust stricter, zodat hij niet een "product code" pakt
     "ean": [
         r"^\s*ean\s*$",
         r"\bgtin\b",
         r"^\s*barcode\s*$",
         r"^\s*upc\s*$",
     ],
-    # Referentie: veel gebruikte namen
     "ref": [
         r"^\s*referentie\s*$",
         r"^ref$",
@@ -272,10 +270,8 @@ def upload_base_ui():
 
             auto = auto_map(raw)
 
-            # Keuze EAN/Titel/Vrij/Verkopen/Forecast verplicht, Referentie aanbevolen
             def pick(lbl, key, optional=False):
                 opts = (["— (geen) —"] if optional else []) + list(raw.columns)
-                # automatisch voorstel
                 default = auto.get(key)
                 idx = (opts.index(default) if default in opts else 0)
                 return st.selectbox(lbl, opts, index=idx)
@@ -288,13 +284,8 @@ def upload_base_ui():
                 "sales_total": pick("Kolom voor Verkopen (Totaal) *","sales_total"),
                 "forecast_min_4w": pick("Kolom voor Verkoopprognose min (Totaal 4w) *","forecast_min_4w"),
             }
-
-            # validatie
-            mandatory = ["ean","title","stock","sales_total","forecast_min_4w"]
-            ok = all(sel[k] not in ["— (geen) —"] for k in mandatory)
-
+            ok = all(sel[k] not in ["— (geen) —"] for k in ["ean","title","stock","sales_total","forecast_min_4w"])
             if st.button("✅ Vastleggen", type="primary", disabled=not ok):
-                # als Referentie niet gekozen is, zet None
                 if sel["ref"] == "— (geen) —":
                     sel["ref"] = None
                 st.session_state.base_df = build_base(raw, sel)
@@ -314,7 +305,6 @@ def merged_inventory():
 
     base["EAN"] = base["EAN"].astype(str).str.strip()
 
-    # incoming optellen
     if not incoming.empty:
         try: incoming["ETA"] = pd.to_datetime(incoming["ETA"]).dt.date
         except Exception: pass
@@ -326,14 +316,12 @@ def merged_inventory():
 
     cols = ["Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
     if not prices.empty:
-        # Merge met suffixes zodat upload-Referentie voorrang kan krijgen
         base = base.merge(
             prices[["EAN"] + cols],
             on="EAN",
             how="left",
             suffixes=("_u", "_p")
         )
-        # Referentie: upload (…_u) > prices (…_p)
         if "Referentie_u" in base.columns or "Referentie_p" in base.columns:
             base["Referentie"] = base.get("Referentie_u","").replace("", np.nan).fillna(base.get("Referentie_p",""))
             base.drop(columns=[c for c in ["Referentie_u","Referentie_p"] if c in base.columns],
@@ -342,7 +330,6 @@ def merged_inventory():
         for c in cols:
             if c not in base.columns: base[c] = 0 if c not in ["Leverancier","Referentie"] else ""
 
-    # numeriek maken
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         base[c] = pd.to_numeric(base[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
@@ -356,14 +343,18 @@ def merged_inventory():
 # =============================
 # Benchmarks + recommend
 # =============================
-def classify(row, over_pct):
+def classify(row, over_units: int):
+    """Label op basis van absolute drempel (stuks) i.p.v. percentage."""
     f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
     stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
-    if stock_total <= 0: return "Out of stock"
-    if f <= 0: return "Healthy"
-    t = (1 + over_pct/100.0)*f
-    if stock_total < f: return "At risk"
-    if stock_total >= t: return "Overstock"
+    if stock_total <= 0:
+        return "Out of stock"
+    if f <= 0:
+        return "Healthy"
+    if stock_total < f:
+        return "At risk"
+    if stock_total >= f + over_units:
+        return "Overstock"
     return "Healthy"
 
 def recommend(row):
@@ -395,13 +386,15 @@ with st.sidebar:
 if choice == "Home":
     st.header("Home")
     if st.session_state.base_df is None:
-        st.info("Nog geen basisdata geladen. Upload hieronder. **Kies ook de kolom 'Referentie' als die in je bestand staat.**")
+        st.info("Nog geen basisdata geladen. Upload hieronder.")
         upload_base_ui()
     inv = merged_inventory()
     if inv is None: st.stop()
 
-    over_pct = st.slider("Overstock-drempel (%)", 5, 50, 20)
-    inv["Status"] = inv.apply(lambda r: classify(r, over_pct), axis=1)
+    # Nieuw: absolute drempel in stuks
+    over_units = st.number_input("Overstock-drempel (stuks)", min_value=0, value=30, step=1)
+
+    inv["Status"] = inv.apply(lambda r: classify(r, over_units), axis=1)
 
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Totale voorraadwaarde (verkoop)", f"€ {inv['Voorraadwaarde (verkoop)'].sum():,.2f}")
