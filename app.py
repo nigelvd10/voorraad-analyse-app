@@ -1,10 +1,10 @@
-# app.py
+# app.py — zonder login, met Referentie uit upload + merge-voorrang
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 import sqlite3, os, re
-from datetime import date, timedelta
+from datetime import date
 
 # =============================
 # App setup & styling
@@ -18,8 +18,6 @@ section[data-testid="stSidebar"] {background:#201915;color:#fff;}
 .nav-btn {display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;margin:6px 6px;color:#eee;text-decoration:none;font-size:18px;}
 .nav-btn:hover {background:rgba(255,255,255,.06);}
 .nav-active {background:#3a2f27;color:#fff;}
-/* chips */
-.status-chip {border-radius:12px;padding:10px 14px;color:#fff;font-weight:600;text-align:center;cursor:pointer;}
 </style>
 """
 st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
@@ -37,19 +35,17 @@ def to_int(x, default=0):
     except Exception:
         return default
 
+# Kolomherkenning incl. Referentie
 PATTERNS = {
     "ean": [r"^\s*ean\s*$", r"\bgtin\b", r"product\s*code", r"art(ikel)?\s*(nr|nummer)?"],
+    "ref": [r"^\s*referentie\s*$", r"^ref$", r"\breference\b", r"\bsku\b", r"artikel\s*code", r"product\s*code"],
     "title": [r"^\s*titel\s*$", r"^\s*naam\s*$", r"product\s*naam", r"title"],
     "stock": [r"vrije\s*voorraad", r"\bvoorraad\b", r"available", r"stock"],
     "sales_total": [r"verkopen\s*\(\s*totaal\s*\)", r"verkopen.*totaal", r"totaal.*verkopen", r"sales\s*total"],
     "forecast_min_4w": [r"verkoopprognose.*4\s*w", r"forecast.*4", r"prognose.*4\s*w",
                         r"verkoopprognose\s*min\s*\(\s*totaal\s*4\s*w\s*\)"],
 }
-TARGETS = {
-    "ean":"EAN","title":"Titel","stock":"Vrije voorraad",
-    "sales_total":"Verkopen (Totaal)","forecast_min_4w":"Verkoopprognose min (Totaal 4w)"
-}
-REQ_ORDER = ["EAN","Titel","Vrije voorraad","Verkopen (Totaal)","Verkoopprognose min (Totaal 4w)"]
+REQ_ORDER = ["EAN","Referentie","Titel","Vrije voorraad","Verkopen (Totaal)","Verkoopprognose min (Totaal 4w)"]
 
 def auto_map(df):
     m={}
@@ -70,8 +66,15 @@ def read_excel_all(file):
     return out
 
 def build_base(df_raw, sel):
+    # Referentie optioneel
+    ref_col = sel.get("ref", "— (leeg laten) —")
+    if ref_col and ref_col not in ["— kies —", "— (leeg laten) —"]:
+        ref_series = df_raw[ref_col].astype(str)
+    else:
+        ref_series = ""
     df = pd.DataFrame({
         "EAN": df_raw[sel["ean"]].astype(str).str.strip(),
+        "Referentie": ref_series,
         "Titel": df_raw[sel["title"]].astype(str),
         "Vrije voorraad": to_num(df_raw[sel["stock"]]),
         "Verkopen (Totaal)": to_num(df_raw[sel["sales_total"]]),
@@ -261,19 +264,27 @@ def upload_base_ui():
             sheet = st.selectbox("Kies sheet", list(sheets.keys()))
             raw = sheets[sheet]
             st.dataframe(raw.head(8), use_container_width=True)
+
             auto = auto_map(raw)
-            def pick(lbl, key):
-                opts=["— kies —"]+list(raw.columns)
-                default = auto.get(key); idx = opts.index(default) if default in opts else 0
+
+            def pick(lbl, key, optional=False):
+                opts = (["— (leeg laten) —"] if optional else []) + ["— kies —"] + list(raw.columns)
+                default = auto.get(key)
+                if default and default in raw.columns:
+                    idx = (1 if optional else 0) + 1 + list(raw.columns).index(default)
+                else:
+                    idx = 0 if optional else 0
                 return st.selectbox(lbl, opts, index=idx)
+
             sel = {
                 "ean": pick("Kolom voor EAN","ean"),
+                "ref": pick("Kolom voor Referentie (optioneel)","ref", optional=True),
                 "title": pick("Kolom voor Titel","title"),
                 "stock": pick("Kolom voor Vrije voorraad","stock"),
                 "sales_total": pick("Kolom voor Verkopen (Totaal)","sales_total"),
                 "forecast_min_4w": pick("Kolom voor Verkoopprognose min (Totaal 4w)","forecast_min_4w"),
             }
-            ok = all(v!="— kies —" for v in sel.values())
+            ok = all(sel[k] != "— kies —" for k in ["ean","title","stock","sales_total","forecast_min_4w"])
             if st.button("✅ Vastleggen", type="primary", disabled=not ok):
                 st.session_state.base_df = build_base(raw, sel)
                 st.success("Basisdata opgeslagen.")
@@ -291,6 +302,8 @@ def merged_inventory():
     incoming = load_incoming().copy()
 
     base["EAN"] = base["EAN"].astype(str).str.strip()
+
+    # incoming optellen
     if not incoming.empty:
         try: incoming["ETA"] = pd.to_datetime(incoming["ETA"]).dt.date
         except Exception: pass
@@ -302,13 +315,27 @@ def merged_inventory():
 
     cols = ["Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
     if not prices.empty:
-        base = base.merge(prices[["EAN"]+cols], on="EAN", how="left")
-    for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
-        if c not in base.columns: base[c]=0
-    if "Leverancier" not in base.columns: base["Leverancier"]=""
-    if "Referentie" not in base.columns: base["Referentie"]=""
+        # Merge met suffixes zodat upload-Referentie voorrang kan krijgen
+        base = base.merge(
+            prices[["EAN"] + cols],
+            on="EAN",
+            how="left",
+            suffixes=("_u", "_p")
+        )
+        # Referentie uit upload (…_u) krijgt voorrang; zo niet, dan uit prices (…_p)
+        if "Referentie_u" in base.columns or "Referentie_p" in base.columns:
+            base["Referentie"] = base.get("Referentie_u", "").replace("", np.nan).fillna(base.get("Referentie_p", ""))
+            base.drop(columns=[c for c in ["Referentie_u","Referentie_p"] if c in base.columns], inplace=True, errors="ignore")
+    else:
+        for c in cols:
+            if c not in base.columns: base[c] = 0 if c not in ["Leverancier","Referentie"] else ""
+
+    # numeriek maken
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         base[c] = pd.to_numeric(base[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
+
+    if "Leverancier" not in base.columns: base["Leverancier"]=""
+    if "Referentie" not in base.columns: base["Referentie"]=""
 
     base["Voorraadwaarde (verkoop)"] = base["Vrije voorraad"] * base["Verkoopprijs"].fillna(0)
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
@@ -370,7 +397,7 @@ if choice == "Home":
     c3.metric("Out of stock", int((inv["Status"]=="Out of stock").sum()))
     c4.metric("At risk", int((inv["Status"]=="At risk").sum()))
 
-    # --- Staafdiagram met vaste kleuren ---
+    # Staafdiagram met vaste kleuren
     st.markdown("**Voorraad gezondheid**")
     order = ["Out of stock","At risk","Healthy","Overstock"]
     counts = inv["Status"].value_counts().reindex(order).fillna(0)
@@ -389,29 +416,17 @@ if choice == "Home":
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # --- Klikbare "chips" om de details te zien (betrouwbare workaround voor chart-click) ---
+    # Klikbare "chips" (betrouwbare workaround voor chart-click) voor details
     st.markdown("**Klik op een categorie voor details**")
-    chip_colors = {
-        "Out of stock": "#E74C3C",
-        "At risk": "#F39C12",
-        "Healthy": "#27AE60",
-        "Overstock": "#34495E",
-    }
     cols = st.columns(4)
     selected = st.session_state.get("selected_status", None)
     for i, s in enumerate(order):
         with cols[i]:
             cnt = int(counts.get(s, 0))
-            pressed = st.button(
-                f"{s} ({cnt})",
-                key=f"chip_{s}",
-                use_container_width=True
-            )
-            if pressed:
+            if st.button(f"{s} ({cnt})", key=f"chip_{s}", use_container_width=True):
                 selected = s
                 st.session_state["selected_status"] = s
 
-    # Details-tabel
     st.markdown("---")
     if selected:
         st.subheader(f"Details: {selected}")
