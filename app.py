@@ -6,7 +6,9 @@ import altair as alt
 import sqlite3, os, re
 from datetime import date, timedelta
 
-# ============ App setup + simpele styling ============
+# =============================
+# App setup & styling
+# =============================
 st.set_page_config(page_title="Voorraad App", layout="wide")
 
 SIDEBAR_CSS = """
@@ -16,11 +18,15 @@ section[data-testid="stSidebar"] {background:#201915;color:#fff;}
 .nav-btn {display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;margin:6px 6px;color:#eee;text-decoration:none;font-size:18px;}
 .nav-btn:hover {background:rgba(255,255,255,.06);}
 .nav-active {background:#3a2f27;color:#fff;}
+/* chips */
+.status-chip {border-radius:12px;padding:10px 14px;color:#fff;font-weight:600;text-align:center;cursor:pointer;}
 </style>
 """
 st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
-# ============ Helpers ============
+# =============================
+# Helpers
+# =============================
 def to_num(x):
     return pd.to_numeric(pd.Series(x).astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
@@ -73,12 +79,13 @@ def build_base(df_raw, sel):
     })
     return df[REQ_ORDER]
 
-# ============ SQLite opslag ============
+# =============================
+# SQLite opslag (blijvend)
+# =============================
 DB_PATH = os.path.join(os.getcwd(), "app_data.db")
 def db(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
-    """Maak tabellen aan + migreer eventuele oude versies."""
     c = db(); cur = c.cursor()
     # prices
     cur.execute("""
@@ -114,7 +121,7 @@ def init_db():
         Opmerking TEXT DEFAULT ''
     )""")
     c.commit()
-    # MIGRATIE voor bestaande DB’s
+    # MIGRATIE suppliers (voeg ontbrekende kolommen toe)
     cur.execute("PRAGMA table_info(suppliers)")
     cols = {row[1] for row in cur.fetchall()}
     if "Productietijd_dagen" not in cols:
@@ -239,7 +246,9 @@ def delete_incoming_row(row_id: int):
     c.commit(); c.close()
     st.cache_data.clear()
 
-# ============ Basisdata upload ============
+# =============================
+# Basisdata upload
+# =============================
 if "base_df" not in st.session_state:
     st.session_state.base_df = None
 
@@ -271,7 +280,9 @@ def upload_base_ui():
         except Exception as e:
             st.error(f"Kon Excel niet lezen: {e}")
 
-# ============ Merge helper ============
+# =============================
+# Merge helper
+# =============================
 def merged_inventory():
     base = st.session_state.base_df
     if base is None: return None
@@ -303,7 +314,9 @@ def merged_inventory():
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
     return base
 
-# ============ Benchmarks + recommend ============
+# =============================
+# Benchmarks + recommend
+# =============================
 def classify(row, over_pct):
     f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
     stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
@@ -323,7 +336,9 @@ def recommend(row):
     moq = to_int(row.get("MOQ",1),1)
     return int(np.ceil(need/max(1,moq))*max(1,moq))
 
-# ============ Sidebar navigatie ============
+# =============================
+# Sidebar navigatie (emoji)
+# =============================
 with st.sidebar:
     st.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
     pages = ["Home", "Inventory", "Suppliers", "Incoming"]
@@ -335,7 +350,9 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
-# ============ Pagina's ============
+# =============================
+# Pages
+# =============================
 if choice == "Home":
     st.header("Home")
     if st.session_state.base_df is None:
@@ -353,15 +370,13 @@ if choice == "Home":
     c3.metric("Out of stock", int((inv["Status"]=="Out of stock").sum()))
     c4.metric("At risk", int((inv["Status"]=="At risk").sum()))
 
+    # --- Staafdiagram met vaste kleuren ---
     st.markdown("**Voorraad gezondheid**")
     order = ["Out of stock","At risk","Healthy","Overstock"]
     counts = inv["Status"].value_counts().reindex(order).fillna(0)
     chart_df = pd.DataFrame({"Status":order,"Aantal":[int(counts.get(s,0)) for s in order]})
     y_max = max(1, int(chart_df["Aantal"].max()))
-    color_scale = alt.Scale(
-        domain=order,
-        range=["#E74C3C", "#F39C12", "#27AE60", "#34495E"]  # rood, oranje, groen, donkerblauw
-    )
+    color_scale = alt.Scale(domain=order, range=["#E74C3C", "#F39C12", "#27AE60", "#34495E"])
     chart = (
         alt.Chart(chart_df)
         .mark_bar()
@@ -374,12 +389,51 @@ if choice == "Home":
     )
     st.altair_chart(chart, use_container_width=True)
 
-    st.markdown("**Toplijst (aanbevolen bestelaantal)**")
-    inv["Aanbevolen bestelaantal"] = inv.apply(recommend, axis=1)
-    st.dataframe(inv[["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
-                      "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]]
-                 .sort_values(["Aanbevolen bestelaantal"], ascending=False),
-                 use_container_width=True)
+    # --- Klikbare "chips" om de details te zien (betrouwbare workaround voor chart-click) ---
+    st.markdown("**Klik op een categorie voor details**")
+    chip_colors = {
+        "Out of stock": "#E74C3C",
+        "At risk": "#F39C12",
+        "Healthy": "#27AE60",
+        "Overstock": "#34495E",
+    }
+    cols = st.columns(4)
+    selected = st.session_state.get("selected_status", None)
+    for i, s in enumerate(order):
+        with cols[i]:
+            cnt = int(counts.get(s, 0))
+            pressed = st.button(
+                f"{s} ({cnt})",
+                key=f"chip_{s}",
+                use_container_width=True
+            )
+            if pressed:
+                selected = s
+                st.session_state["selected_status"] = s
+
+    # Details-tabel
+    st.markdown("---")
+    if selected:
+        st.subheader(f"Details: {selected}")
+        df_sel = inv[inv["Status"]==selected].copy()
+        if df_sel.empty:
+            st.info("Geen producten in deze categorie.")
+        else:
+            df_sel["Aanbevolen bestelaantal"] = df_sel.apply(recommend, axis=1)
+            st.dataframe(
+                df_sel[["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
+                        "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]],
+                use_container_width=True
+            )
+    else:
+        st.subheader("Toplijst (aanbevolen bestelaantal)")
+        inv["Aanbevolen bestelaantal"] = inv.apply(recommend, axis=1)
+        st.dataframe(
+            inv[["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
+                 "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]]
+            .sort_values(["Aanbevolen bestelaantal"], ascending=False),
+            use_container_width=True
+        )
 
 elif choice == "Inventory":
     st.header("Inventory")
