@@ -1,70 +1,32 @@
-# app.py — Login vast in code (Nigel / G&N2k25) + app
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-import sqlite3, os, re, unicodedata
+import sqlite3, os, re
 from datetime import date, timedelta
 
-# ================== LOGIN-INSTELLINGEN ==================
-APP_TITLE = "Voorraad App (secure)"
-# Toegestane accounts: {lowercase_username: exact_password}
-AUTH_USERS = {"nigel": "G&N2k25"}  # << HIER NIET WIJZIGEN TZIJDAT JE EEN ANDERE LOGIN WILT
+# =============================
+# App setup & styling
+# =============================
+st.set_page_config(page_title="Voorraad App", layout="wide")
 
-# ================== APP-SETUP & STYLES ==================
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.markdown("""
+SIDEBAR_CSS = """
 <style>
 section[data-testid="stSidebar"] {background:#201915;color:#fff;}
 .sidebar-title {font-size:28px;font-weight:700;margin:8px 0 16px 4px;color:#fff;}
 .nav-btn {display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;margin:6px 6px;color:#eee;text-decoration:none;font-size:18px;}
 .nav-btn:hover {background:rgba(255,255,255,.06);}
 .nav-active {background:#3a2f27;color:#fff;}
+/* chips */
+.status-chip {border-radius:12px;padding:10px 14px;color:#fff;font-weight:600;text-align:center;cursor:pointer;}
 </style>
-""", unsafe_allow_html=True)
+"""
+st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
-# ================== AUTH ==================
-def _normalize(s: str) -> str:
-    # strip spaties, normaliseer unicode (NFC), verwijder onzichtbare whitespace
-    s = (s or "")
-    s = unicodedata.normalize("NFC", s)
-    s = s.replace("\u200b", "").replace("\u200e", "").replace("\u200f", "")  # zero-width en RTL marks
-    return s.strip()
-
-def login_screen():
-    st.title("🔐 Inloggen")
-    u = st.text_input("Gebruikersnaam")
-    show = st.checkbox("Toon wachtwoord", value=False)
-    p = st.text_input("Wachtwoord", type=("text" if show else "password"))
-    if st.button("Inloggen", type="primary"):
-        u_norm = _normalize(u).lower()      # gebruikersnaam case-insensitive
-        p_norm = _normalize(p)              # wachtwoord exact, maar zonder per ongeluk spaties
-        ok = (u_norm in AUTH_USERS) and (p_norm == AUTH_USERS[u_norm])
-        if ok:
-            st.session_state["auth_ok"] = True
-            st.session_state["auth_user"] = u_norm
-            st.experimental_rerun()
-        else:
-            # Kleine debug-hint om te zien of & en lengte kloppen
-            st.error("Onjuiste inloggegevens.")
-            st.caption(f"🧩 Debug-hint: gebruikersnaam='{_normalize(u)}' (lower='{u_norm}'), wachtwoord-lengte={len(p_norm)}")
-
-def require_login():
-    if not st.session_state.get("auth_ok"):
-        login_screen()
-        st.stop()
-
-require_login()
-
-# Logout
-with st.sidebar:
-    st.write(f"👤 Ingelogd als **{st.session_state.get('auth_user','?')}**")
-    if st.button("🚪 Uitloggen", use_container_width=True):
-        for k in ["auth_ok","auth_user","_page"]:
-            st.session_state.pop(k, None)
-        st.experimental_rerun()
-
-# ================== HELPERS ==================
+# =============================
+# Helpers
+# =============================
 def to_num(x):
     return pd.to_numeric(pd.Series(x).astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
@@ -82,6 +44,10 @@ PATTERNS = {
     "sales_total": [r"verkopen\s*\(\s*totaal\s*\)", r"verkopen.*totaal", r"totaal.*verkopen", r"sales\s*total"],
     "forecast_min_4w": [r"verkoopprognose.*4\s*w", r"forecast.*4", r"prognose.*4\s*w",
                         r"verkoopprognose\s*min\s*\(\s*totaal\s*4\s*w\s*\)"],
+}
+TARGETS = {
+    "ean":"EAN","title":"Titel","stock":"Vrije voorraad",
+    "sales_total":"Verkopen (Totaal)","forecast_min_4w":"Verkoopprognose min (Totaal 4w)"
 }
 REQ_ORDER = ["EAN","Titel","Vrije voorraad","Verkopen (Totaal)","Verkoopprognose min (Totaal 4w)"]
 
@@ -113,12 +79,15 @@ def build_base(df_raw, sel):
     })
     return df[REQ_ORDER]
 
-# ================== SQLite OPSLAG ==================
+# =============================
+# SQLite opslag (blijvend)
+# =============================
 DB_PATH = os.path.join(os.getcwd(), "app_data.db")
 def db(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
     c = db(); cur = c.cursor()
+    # prices
     cur.execute("""
     CREATE TABLE IF NOT EXISTS prices (
         EAN TEXT PRIMARY KEY,
@@ -131,6 +100,7 @@ def init_db():
         MOQ INTEGER DEFAULT 1,
         Levertijd_dagen INTEGER DEFAULT 0
     )""")
+    # suppliers (uitgebreid)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS suppliers (
         Naam TEXT PRIMARY KEY,
@@ -139,6 +109,7 @@ def init_db():
         Levertijd_zee_dagen INTEGER DEFAULT 0,
         Levertijd_lucht_dagen INTEGER DEFAULT 0
     )""")
+    # incoming
     cur.execute("""
     CREATE TABLE IF NOT EXISTS incoming (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,7 +121,7 @@ def init_db():
         Opmerking TEXT DEFAULT ''
     )""")
     c.commit()
-    # migratie kolommen
+    # MIGRATIE suppliers (voeg ontbrekende kolommen toe)
     cur.execute("PRAGMA table_info(suppliers)")
     cols = {row[1] for row in cur.fetchall()}
     if "Productietijd_dagen" not in cols:
@@ -161,13 +132,15 @@ def init_db():
         cur.execute("ALTER TABLE suppliers ADD COLUMN Levertijd_lucht_dagen INTEGER DEFAULT 0")
     c.commit(); c.close()
 
+# ---- prijzen
 @st.cache_data(show_spinner=False)
 def load_prices():
     init_db()
     c=db()
     df=pd.read_sql_query(
         "SELECT EAN, Referentie, Verkoopprijs, Inkoopprijs, Verzendkosten, "
-        "Overige_kosten AS 'Overige kosten', Leverancier, MOQ, Levertijd_dagen AS 'Levertijd (dagen)' FROM prices", c)
+        "Overige_kosten AS 'Overige kosten', Leverancier, MOQ, Levertijd_dagen AS 'Levertijd (dagen)' "
+        "FROM prices", c)
     c.close()
     if df.empty:
         df=pd.DataFrame(columns=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten",
@@ -205,6 +178,7 @@ def save_prices(df):
     c.commit(); c.close()
     st.cache_data.clear()
 
+# ---- suppliers
 @st.cache_data(show_spinner=False)
 def load_suppliers():
     init_db()
@@ -247,6 +221,7 @@ def delete_supplier(name: str):
     c.commit(); c.close()
     st.cache_data.clear()
 
+# ---- incoming
 @st.cache_data(show_spinner=False)
 def load_incoming():
     init_db()
@@ -271,7 +246,9 @@ def delete_incoming_row(row_id: int):
     c.commit(); c.close()
     st.cache_data.clear()
 
-# ================== BASISDATA UPLOAD (tijdelijk) ==================
+# =============================
+# Basisdata upload
+# =============================
 if "base_df" not in st.session_state:
     st.session_state.base_df = None
 
@@ -303,7 +280,9 @@ def upload_base_ui():
         except Exception as e:
             st.error(f"Kon Excel niet lezen: {e}")
 
-# ================== MERGE HELPER ==================
+# =============================
+# Merge helper
+# =============================
 def merged_inventory():
     base = st.session_state.base_df
     if base is None: return None
@@ -335,7 +314,9 @@ def merged_inventory():
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
     return base
 
-# ================== BENCHMARKS ==================
+# =============================
+# Benchmarks + recommend
+# =============================
 def classify(row, over_pct):
     f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
     stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
@@ -355,7 +336,9 @@ def recommend(row):
     moq = to_int(row.get("MOQ",1),1)
     return int(np.ceil(need/max(1,moq))*max(1,moq))
 
-# ================== NAVIGATION ==================
+# =============================
+# Sidebar navigatie (emoji)
+# =============================
 with st.sidebar:
     st.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
     pages = ["Home", "Inventory", "Suppliers", "Incoming"]
@@ -367,11 +350,13 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
-# ================== PAGES ==================
+# =============================
+# Pages
+# =============================
 if choice == "Home":
     st.header("Home")
     if st.session_state.base_df is None:
-        st.info("Nog geen basisdata geladen. Upload hieronder (tijdelijk, tot API-koppeling).")
+        st.info("Nog geen basisdata geladen. Upload hieronder.")
         upload_base_ui()
     inv = merged_inventory()
     if inv is None: st.stop()
@@ -385,12 +370,13 @@ if choice == "Home":
     c3.metric("Out of stock", int((inv["Status"]=="Out of stock").sum()))
     c4.metric("At risk", int((inv["Status"]=="At risk").sum()))
 
+    # --- Staafdiagram met vaste kleuren ---
     st.markdown("**Voorraad gezondheid**")
     order = ["Out of stock","At risk","Healthy","Overstock"]
     counts = inv["Status"].value_counts().reindex(order).fillna(0)
     chart_df = pd.DataFrame({"Status":order,"Aantal":[int(counts.get(s,0)) for s in order]})
     y_max = max(1, int(chart_df["Aantal"].max()))
-    color_scale = alt.Scale(domain=order, range=["#E74C3C","#F39C12","#27AE60","#34495E"])
+    color_scale = alt.Scale(domain=order, range=["#E74C3C", "#F39C12", "#27AE60", "#34495E"])
     chart = (
         alt.Chart(chart_df)
         .mark_bar()
@@ -403,17 +389,56 @@ if choice == "Home":
     )
     st.altair_chart(chart, use_container_width=True)
 
-    st.markdown("**Toplijst (aanbevolen bestelaantal)**")
-    inv["Aanbevolen bestelaantal"] = inv.apply(recommend, axis=1)
-    st.dataframe(inv[["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
-                      "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]]
-                 .sort_values(["Aanbevolen bestelaantal"], ascending=False),
-                 use_container_width=True)
+    # --- Klikbare "chips" om de details te zien (betrouwbare workaround voor chart-click) ---
+    st.markdown("**Klik op een categorie voor details**")
+    chip_colors = {
+        "Out of stock": "#E74C3C",
+        "At risk": "#F39C12",
+        "Healthy": "#27AE60",
+        "Overstock": "#34495E",
+    }
+    cols = st.columns(4)
+    selected = st.session_state.get("selected_status", None)
+    for i, s in enumerate(order):
+        with cols[i]:
+            cnt = int(counts.get(s, 0))
+            pressed = st.button(
+                f"{s} ({cnt})",
+                key=f"chip_{s}",
+                use_container_width=True
+            )
+            if pressed:
+                selected = s
+                st.session_state["selected_status"] = s
+
+    # Details-tabel
+    st.markdown("---")
+    if selected:
+        st.subheader(f"Details: {selected}")
+        df_sel = inv[inv["Status"]==selected].copy()
+        if df_sel.empty:
+            st.info("Geen producten in deze categorie.")
+        else:
+            df_sel["Aanbevolen bestelaantal"] = df_sel.apply(recommend, axis=1)
+            st.dataframe(
+                df_sel[["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
+                        "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]],
+                use_container_width=True
+            )
+    else:
+        st.subheader("Toplijst (aanbevolen bestelaantal)")
+        inv["Aanbevolen bestelaantal"] = inv.apply(recommend, axis=1)
+        st.dataframe(
+            inv[["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
+                 "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]]
+            .sort_values(["Aanbevolen bestelaantal"], ascending=False),
+            use_container_width=True
+        )
 
 elif choice == "Inventory":
     st.header("Inventory")
     if st.session_state.base_df is None:
-        st.info("Upload eerst je basisbestand (tijdelijk).")
+        st.info("Upload eerst je basisbestand.")
         upload_base_ui()
     inv = merged_inventory()
     if inv is not None:
@@ -473,7 +498,7 @@ elif choice == "Suppliers":
         del_name = st.selectbox("🗑️ Verwijderen: kies leverancier", ["—"] + sup_edit["Naam"].astype(str).tolist())
         if st.button("Verwijder geselecteerde"):
             if del_name and del_name != "—":
-                delete_supplier(del_name); st.success(f"'{del_name}' verwijderd."); st.cache_data.clear(); st.experimental_rerun()
+                delete_supplier(del_name); st.success(f"'{del_name}' verwijderd."); st.cache_data.clear()
 
 elif choice == "Incoming":
     st.header("Incoming")
@@ -507,6 +532,6 @@ elif choice == "Incoming":
         del_id = st.number_input("ID (zie kolom 'id')", min_value=0, step=1, value=0)
         if st.button("🗑️ Verwijder ID"):
             if del_id>0 and (inc["id"]==del_id).any():
-                delete_incoming_row(int(del_id)); st.success("Verwijderd."); st.cache_data.clear(); st.experimental_rerun()
+                delete_incoming_row(int(del_id)); st.success("Verwijderd."); st.cache_data.clear()
             else:
                 st.warning("Onbekend ID.")
