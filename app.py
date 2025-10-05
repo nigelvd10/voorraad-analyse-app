@@ -4,6 +4,7 @@ import numpy as np
 import io
 import re
 from datetime import date, timedelta
+import altair as alt
 
 # =============================
 # Pagina-setup & CSS (simple theming)
@@ -106,12 +107,12 @@ def build_base(df_raw, sel):
     return df[REQUIRED_ORDER]
 
 
-def classify_status(row, incoming_qty):
+def classify_status(row, incoming_qty, overstock_pct):
     """Classificatie o.b.v. vergelijking van (voorraad + incoming) met 4w-forecast.
-    Regels:
-    - Overstock: >= 120% van forecast
+    Regels (met slider):
+    - Overstock: >= (1 + pct) × forecast
     - Out of stock: totale voorraad <= 0
-    - Healthy: tussen 100% en 120% van forecast (inclusief exact forecast)
+    - Healthy: tussen 100% en < (1 + pct) × forecast
     - At risk: < 100% van forecast (maar > 0 voorraad)
     - Als forecast <= 0: Healthy (tenzij voorraad <= 0 → Out of stock)
     """
@@ -121,6 +122,12 @@ def classify_status(row, incoming_qty):
         return "Out of stock"
     if f <= 0:
         return "Healthy"
+    threshold = (1.0 + overstock_pct/100.0) * f
+    if stock_total < f:
+        return "At risk"
+    if stock_total >= threshold:
+        return "Overstock"
+    return "Healthy"
     if stock_total < f:
         return "At risk"
     if stock_total >= 1.2 * f:
@@ -154,8 +161,11 @@ if "incoming_df" not in st.session_state:
 # =============================
 with st.sidebar:
     st.header("⚙️ Instellingen")
-    target_days = st.slider("Target days of cover", 7, 60, 28, help="Doel aantal dagen voorraad dat je wil afdekken")
-    safety_days = st.slider("Safety buffer (dagen)", 0, 30, 7, help="Extra veiligheidsbuffer in dagen")
+    # Benchmark instellingen
+    overstock_pct = st.slider("Overstock-drempel (%)", 5, 50, 20, help="Percentage boven de 4w-forecast waarbij een product als Overstock telt")
+    # (oude sliders niet meer nodig voor benchmarks, maar kun je bewaren als je ze elders gebruikt)
+    target_days = st.slider("Target days of cover", 7, 60, 28, help="(Optioneel) Niet meer gebruikt in benchmarks, wel in berekeningen elders")
+    safety_days = st.slider("Safety buffer (dagen)", 0, 30, 7, help="(Optioneel) Niet meer gebruikt in benchmarks, wel in berekeningen elders")
     st.markdown("—")
     st.subheader("Imports")
     base_file = st.file_uploader("Upload basisbestand (.xlsx)", type=["xlsx"], key="base")
@@ -300,7 +310,7 @@ with T2:
         for _, r in data.iterrows():
             moq = to_int_safe(r.get("MOQ", 1), 1)
             incoming_qty = to_float_safe(r.get("Incoming", 0), 0)
-            statuses.append(classify_status(r, incoming_qty))
+            statuses.append(classify_status(r, incoming_qty, overstock_pct))
         data["Status"] = statuses
 
         # KPI's
@@ -329,11 +339,21 @@ with T2:
         else:
             view = data.copy()
 
-        # Gezondheidsdiagram (volgorde vast)
-        st.markdown("**Voorraad gezondheid**")
+        # Gezondheidsdiagram (volgorde vast en vaste y-as, geen zoom)
         order = ["Out of stock","At risk","Healthy","Overstock"]
         health_counts = data["Status"].value_counts().reindex(order).fillna(0)
-        st.bar_chart(health_counts)
+        health_df = pd.DataFrame({"Status": order, "Aantal": [int(health_counts.get(s,0)) for s in order]})
+        y_max = max(1, int(health_df["Aantal"].max()))
+        chart = (
+            alt.Chart(health_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("Status:N", sort=order),
+                y=alt.Y("Aantal:Q", scale=alt.Scale(domain=(0, y_max)))
+            )
+            .properties(height=280)
+        )
+        st.altair_chart(chart, use_container_width=True)
 
 
         st.markdown("**Producten**")
