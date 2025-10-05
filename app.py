@@ -1,4 +1,4 @@
-# app.py — Overstock op absolute drempel (stuks)
+# app.py — Overstock op absolute drempel + All products-chip + forecast afronden omhoog
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -84,13 +84,18 @@ def read_excel_all(file):
 def build_base(df_raw, sel):
     ref_col = sel.get("ref")
     ref_series = df_raw[ref_col].astype(str) if ref_col else ""
+
+    # Prognose naar boven afronden
+    forecast_raw = to_num(df_raw[sel["forecast_min_4w"]])
+    forecast_ceiled = np.ceil(forecast_raw).astype(int)
+
     df = pd.DataFrame({
         "EAN": df_raw[sel["ean"]].astype(str).str.strip(),
         "Referentie": ref_series,
         "Titel": df_raw[sel["title"]].astype(str),
         "Vrije voorraad": to_num(df_raw[sel["stock"]]),
         "Verkopen (Totaal)": to_num(df_raw[sel["sales_total"]]),
-        "Verkoopprognose min (Totaal 4w)": to_num(df_raw[sel["forecast_min_4w"]]),
+        "Verkoopprognose min (Totaal 4w)": forecast_ceiled,
     })
     return df[REQ_ORDER]
 
@@ -344,7 +349,7 @@ def merged_inventory():
 # Benchmarks + recommend
 # =============================
 def classify(row, over_units: int):
-    """Label op basis van absolute drempel (stuks) i.p.v. percentage."""
+    """Label op basis van absolute drempel (stuks)."""
     f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
     stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
     if stock_total <= 0:
@@ -391,7 +396,7 @@ if choice == "Home":
     inv = merged_inventory()
     if inv is None: st.stop()
 
-    # Nieuw: absolute drempel in stuks
+    # Absolute drempel in stuks
     over_units = st.number_input("Overstock-drempel (stuks)", min_value=0, value=30, step=1)
 
     inv["Status"] = inv.apply(lambda r: classify(r, over_units), axis=1)
@@ -421,21 +426,34 @@ if choice == "Home":
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # Klikbare chips voor details
+    # Klikbare chips voor details — nu met "All products"
     st.markdown("**Klik op een categorie voor details**")
-    cols = st.columns(4)
+    chip_order = ["All products"] + order
+    chip_counts = {
+        "All products": len(inv),
+        "Out of stock": int(counts.get("Out of stock",0)),
+        "At risk": int(counts.get("At risk",0)),
+        "Healthy": int(counts.get("Healthy",0)),
+        "Overstock": int(counts.get("Overstock",0)),
+    }
+    cols = st.columns(len(chip_order))
     selected = st.session_state.get("selected_status", None)
-    for i, s in enumerate(order):
+    for i, s in enumerate(chip_order):
         with cols[i]:
-            cnt = int(counts.get(s, 0))
+            cnt = chip_counts.get(s, 0)
             if st.button(f"{s} ({cnt})", key=f"chip_{s}", use_container_width=True):
                 selected = s
                 st.session_state["selected_status"] = s
 
     st.markdown("---")
     if selected:
-        st.subheader(f"Details: {selected}")
-        df_sel = inv[inv["Status"]==selected].copy()
+        if selected == "All products":
+            st.subheader("Details: All products")
+            df_sel = inv.copy()
+        else:
+            st.subheader(f"Details: {selected}")
+            df_sel = inv[inv["Status"]==selected].copy()
+
         if df_sel.empty:
             st.info("Geen producten in deze categorie.")
         else:
