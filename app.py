@@ -78,6 +78,22 @@ def coerce_num(x):
     return pd.to_numeric(pd.Series(x).astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0)
 
 
+def to_int_safe(x, default=1):
+    try:
+        v = pd.to_numeric(str(x).replace(',', '.'), errors='coerce')
+        return int(v) if pd.notna(v) else default
+    except Exception:
+        return default
+
+
+def to_float_safe(x, default=0.0):
+    try:
+        v = pd.to_numeric(str(x).replace(',', '.'), errors='coerce')
+        return float(v) if pd.notna(v) else default
+    except Exception:
+        return default
+
+
 def build_base(df_raw, sel):
     df = pd.DataFrame({
         "EAN": df_raw[sel["ean"]].astype(str).str.strip(),
@@ -256,8 +272,13 @@ def merged_frame():
         base = base.merge(prices[["EAN"]+cols_prices], on="EAN", how="left")
     # defaulten
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
-        if c not in base.columns: base[c]=0
-    if "Leverancier" not in base.columns: base["Leverancier"]=""
+        if c not in base.columns:
+            base[c] = 0
+    if "Leverancier" not in base.columns:
+        base["Leverancier"] = ""
+    # type-coercion (robust tegen lege/tekst waardes)
+    for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
+        base[c] = pd.to_numeric(base[c].astype(str).str.replace(',', '.', regex=False), errors='coerce').fillna(0)
     # berekeningen
     base["Voorraadwaarde (verkoop)"] = base["Vrije voorraad"] * base["Verkoopprijs"].fillna(0)
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
@@ -273,8 +294,8 @@ with T2:
         # status classificatie
         statuses = []
         for _, r in data.iterrows():
-            moq = int(r.get("MOQ", 1) or 1)
-            incoming_qty = float(r.get("Incoming", 0) or 0)
+            moq = to_int_safe(r.get("MOQ", 1), 1)
+            incoming_qty = to_float_safe(r.get("Incoming", 0), 0)
             statuses.append(classify_status(r, target_days, safety_days, incoming_qty))
         data["Status"] = statuses
 
@@ -292,8 +313,8 @@ with T2:
         # bereken recommendaties
         recs = []
         for _, r in data.iterrows():
-            moq = int(r.get("MOQ", 1) or 1)
-            incoming_qty = float(r.get("Incoming", 0) or 0)
+            moq = to_int_safe(r.get("MOQ", 1), 1)
+            incoming_qty = to_float_safe(r.get("Incoming", 0), 0)
             qty = recommend_qty(r, target_days, safety_days, incoming_qty, moq)
             recs.append(qty)
         data["Aanbevolen bestelaantal"] = recs
@@ -330,7 +351,7 @@ with T3:
     if data is None:
         st.info("Nog geen basisdata. Ga naar **📥 Data & Mapping**.")
     else:
-        data["Aanbevolen bestelaantal"] = data.apply(lambda r: recommend_qty(r, target_days, safety_days, float(r.get("Incoming",0) or 0), int(r.get("MOQ",1) or 1)), axis=1)
+        data["Aanbevolen bestelaantal"] = data.apply(lambda r: recommend_qty(r, target_days, safety_days, to_float_safe(r.get("Incoming",0),0), to_int_safe(r.get("MOQ",1),1)), axis=1)
         df_order = data[data["Aanbevolen bestelaantal"]>0].copy()
         if df_order.empty:
             st.success("Er zijn momenteel geen aanbevelingen om te bestellen.")
