@@ -1,32 +1,49 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import io
 import re
+from datetime import date, timedelta
 import altair as alt
 import sqlite3
 import os
-from datetime import date, timedelta
 
 # =============================
-# Basis instellingen
+# Pagina-setup & CSS (simple theming)
 # =============================
 st.set_page_config(page_title="Voorraad Dashboard", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .chip {padding:6px 10px;border-radius:999px;border:1px solid #e6e6e6;margin-right:6px;background:#fff;font-size:12px}
+    .chip.red{background:#ffe6e6;border-color:#ffb3b3}
+    .chip.amber{background:#fff3e0;border-color:#ffd199}
+    .chip.orange{background:#ffe8d6;border-color:#ffc38a}
+    .chip.green{background:#e6ffe9;border-color:#b3ffbf}
+    .chip.gray{background:#f2f2f2;border-color:#e0e0e0}
+    .card{background:#fff;border:1px solid #eee;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.03); color:#111}
+    .card .metric-big{color:#111}
+    .metric-big{font-size:28px;font-weight:700}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("📦 Voorraad Dashboard")
-st.caption("Upload je basisbestand, stel prijzen in, bekijk gezondheid en maak besteloverzichten.")
+st.caption("Upload je basisbestand en beheer benchmarks, voorraadwaarde, inkomende voorraad en besteloverzichten.")
 
 # =============================
-# Helpers (kolomherkenning, types)
+# Helpers
 # =============================
 PATTERNS = {
     "ean": [r"^\s*ean\s*$", r"\bgtin\b", r"product\s*code", r"art(ikel)?\s*(nr|nummer)?"],
     "title": [r"^\s*titel\s*$", r"^\s*naam\s*$", r"product\s*naam", r"title"],
     "stock": [r"vrije\s*voorraad", r"\bvoorraad\b", r"available", r"stock"],
     "sales_total": [r"verkopen\s*\(\s*totaal\s*\)", r"verkopen.*totaal", r"totaal.*verkopen", r"sales\s*total"],
-    "forecast_min_4w": [r"verkoopprognose.*4\s*w", r"forecast.*4", r"prognose.*4\s*w",
-                        r"verkoopprognose\s*min\s*\(\s*totaal\s*4\s*w\s*\)"],
+    "forecast_min_4w": [r"verkoopprognose.*4\s*w", r"forecast.*4", r"prognose.*4\s*w", r"verkoopprognose\s*min\s*\(\s*totaal\s*4\s*w\s*\)"],
 }
+
 TARGET_NAMES = {
     "ean": "EAN",
     "title": "Titel",
@@ -34,34 +51,10 @@ TARGET_NAMES = {
     "sales_total": "Verkopen (Totaal)",
     "forecast_min_4w": "Verkoopprognose min (Totaal 4w)",
 }
-REQUIRED_ORDER = ["EAN", "Titel", "Vrije voorraad", "Verkopen (Totaal)", "Verkoopprognose min (Totaal 4w)"]
 
-def auto_map_columns(df: pd.DataFrame):
-    mapping = {}
-    for key, patterns in PATTERNS.items():
-        for c in df.columns:
-            c_norm = str(c).strip().lower()
-            if any(re.search(p, c_norm, flags=re.I) for p in patterns):
-                mapping[key] = c
-                break
-    return mapping
-
-def coerce_num(x):
-    return pd.to_numeric(pd.Series(x).astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0)
-
-def to_int_safe(x, default=1):
-    try:
-        v = pd.to_numeric(str(x).replace(",", "."), errors="coerce")
-        return int(v) if pd.notna(v) else default
-    except Exception:
-        return default
-
-def to_float_safe(x, default=0.0):
-    try:
-        v = pd.to_numeric(str(x).replace(",", "."), errors="coerce")
-        return float(v) if pd.notna(v) else default
-    except Exception:
-        return default
+REQUIRED_ORDER = [
+    "EAN","Titel","Vrije voorraad","Verkopen (Totaal)","Verkoopprognose min (Totaal 4w)"
+]
 
 @st.cache_data(show_spinner=False)
 def read_excel_all(file):
@@ -73,6 +66,38 @@ def read_excel_all(file):
         cleaned[s] = df
     return cleaned
 
+
+def auto_map_columns(df: pd.DataFrame):
+    mapping = {}
+    for key, patterns in PATTERNS.items():
+        for c in df.columns:
+            c_norm = str(c).strip().lower()
+            if any(re.search(p, c_norm, flags=re.I) for p in patterns):
+                mapping[key] = c
+                break
+    return mapping
+
+
+def coerce_num(x):
+    return pd.to_numeric(pd.Series(x).astype(str).str.replace(",", ".", regex=False), errors="coerce").fillna(0)
+
+
+def to_int_safe(x, default=1):
+    try:
+        v = pd.to_numeric(str(x).replace(',', '.'), errors='coerce')
+        return int(v) if pd.notna(v) else default
+    except Exception:
+        return default
+
+
+def to_float_safe(x, default=0.0):
+    try:
+        v = pd.to_numeric(str(x).replace(',', '.'), errors='coerce')
+        return float(v) if pd.notna(v) else default
+    except Exception:
+        return default
+
+
 def build_base(df_raw, sel):
     df = pd.DataFrame({
         "EAN": df_raw[sel["ean"]].astype(str).str.strip(),
@@ -83,13 +108,54 @@ def build_base(df_raw, sel):
     })
     return df[REQUIRED_ORDER]
 
+
+def classify_status(row, incoming_qty, overstock_pct):
+    """Classificatie o.b.v. vergelijking van (voorraad + incoming) met 4w-forecast.
+    Regels (met slider):
+    - Overstock: >= (1 + pct) × forecast
+    - Out of stock: totale voorraad <= 0
+    - Healthy: tussen 100% en < (1 + pct) × forecast
+    - At risk: < 100% van forecast (maar > 0 voorraad)
+    - Als forecast <= 0: Healthy (tenzij voorraad <= 0 → Out of stock)
+    """
+    f = float(row.get("Verkoopprognose min (Totaal 4w)", 0) or 0)
+    stock_total = float(row.get("Vrije voorraad", 0) or 0) + float(incoming_qty or 0)
+    if stock_total <= 0:
+        return "Out of stock"
+    if f <= 0:
+        return "Healthy"
+    threshold = (1.0 + overstock_pct/100.0) * f
+    if stock_total < f:
+        return "At risk"
+    if stock_total >= threshold:
+        return "Overstock"
+    return "Healthy"
+    if stock_total < f:
+        return "At risk"
+    if stock_total >= 1.2 * f:
+        return "Overstock"
+    return "Healthy"
+
+
+def recommend_qty(row, incoming_qty, moq=1):
+    # Simpele aanbeveling: bestel tot 110% van forecast (4w) als je onder forecast zit
+    f = float(row.get("Verkoopprognose min (Totaal 4w)", 0) or 0)
+    stock_total = float(row.get("Vrije voorraad", 0) or 0) + float(incoming_qty or 0)
+    if f <= 0:
+        return 0
+    target = 1.1 * f  # klein buffer
+    need = max(0.0, target - stock_total)
+    need_rounded = int(np.ceil(need / max(1, moq)) * max(1, moq))
+    return need_rounded
+
 # =============================
-# SQLite opslag prijzen (blijvend in app)
+# SQLite – eenvoudige lokale opslag voor prijzen (1 bestand in app-map)
 # =============================
 DB_PATH = os.path.join(os.getcwd(), "prices.db")
 
 def _get_db_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
 
 def init_prices_table():
     conn = _get_db_conn()
@@ -98,6 +164,7 @@ def init_prices_table():
         """
         CREATE TABLE IF NOT EXISTS prices (
             EAN TEXT PRIMARY KEY,
+            Referentie TEXT DEFAULT '',
             Verkoopprijs REAL DEFAULT 0,
             Inkoopprijs REAL DEFAULT 0,
             Verzendkosten REAL DEFAULT 0,
@@ -116,14 +183,14 @@ def load_prices_from_db() -> pd.DataFrame:
     init_prices_table()
     conn = _get_db_conn()
     df = pd.read_sql_query(
-        "SELECT EAN, Verkoopprijs, Inkoopprijs, Verzendkosten, Overige_kosten AS 'Overige kosten', "
+        "SELECT EAN, Referentie, Verkoopprijs, Inkoopprijs, Verzendkosten, Overige_kosten AS 'Overige kosten', "
         "Leverancier, MOQ, Levertijd_dagen AS 'Levertijd (dagen)' FROM prices",
         conn,
     )
     conn.close()
     if df.empty:
-        df = pd.DataFrame(columns=["EAN","Verkoopprijs","Inkoopprijs","Verzendkosten",
-                                   "Overige kosten","Leverancier","MOQ","Levertijd (dagen)"])
+        df = pd.DataFrame(columns=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"])
+    # type coercion
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     df["EAN"] = df["EAN"].astype(str).str.strip()
@@ -131,6 +198,7 @@ def load_prices_from_db() -> pd.DataFrame:
 
 def save_prices_to_db(df: pd.DataFrame):
     init_prices_table()
+    # normaliseer kolomnamen
     expected = ["EAN","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
     for c in expected:
         if c not in df.columns:
@@ -139,7 +207,7 @@ def save_prices_to_db(df: pd.DataFrame):
     df["EAN"] = df["EAN"].astype(str).str.strip()
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.', regex=False), errors='coerce').fillna(0)
-
+    # schrijven
     conn = _get_db_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM prices")
@@ -169,69 +237,37 @@ def save_prices_to_db(df: pd.DataFrame):
     conn.close()
 
 # =============================
-# Status + aanbeveling (jouw 4 benchmarks + slider)
-# =============================
-def classify_status(row, incoming_qty, overstock_pct):
-    f = float(row.get("Verkoopprognose min (Totaal 4w)", 0) or 0)
-    stock_total = float(row.get("Vrije voorraad", 0) or 0) + float(incoming_qty or 0)
-    if stock_total <= 0:
-        return "Out of stock"
-    if f <= 0:
-        return "Healthy"
-    threshold = (1.0 + overstock_pct/100.0) * f
-    if stock_total < f:
-        return "At risk"    # >0 voorraad en minder dan forecast
-    if stock_total >= threshold:
-        return "Overstock"  # >= (1 + pct) * forecast
-    return "Healthy"        # tussen 100% en threshold
-
-def recommend_qty(row, incoming_qty, moq=1):
-    # Eenvoudig: bestel tot 110% van forecast als je onder forecast zit
-    f = float(row.get("Verkoopprognose min (Totaal 4w)", 0) or 0)
-    stock_total = float(row.get("Vrije voorraad", 0) or 0) + float(incoming_qty or 0)
-    if f <= 0:
-        return 0
-    target = 1.1 * f
-    need = max(0.0, target - stock_total)
-    need_rounded = int(np.ceil(need / max(1, moq)) * max(1, moq))
-    return need_rounded
-
-# =============================
-# STATE init
+# STATE-init
 # =============================
 if "base_df" not in st.session_state:
     st.session_state.base_df = None
 if "prices_df" not in st.session_state:
+    # Laad direct uit lokale database (SQLite) zodat prijzen blijven bewaard
     try:
         st.session_state.prices_df = load_prices_from_db()
     except Exception:
-        st.session_state.prices_df = pd.DataFrame(columns=["EAN","Verkoopprijs","Inkoopprijs",
-                                                           "Verzendkosten","Overige kosten","Leverancier",
-                                                           "MOQ","Levertijd (dagen)"])
+        st.session_state.prices_df = pd.DataFrame(columns=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"])
 if "incoming_df" not in st.session_state:
-    st.session_state.incoming_df = pd.DataFrame(columns=["EAN","Aantal","ETA","Leverancier"])
+    st.session_state.incoming_df = pd.DataFrame(columns=["EAN","Aantal","ETA","Leverancier"])  # ETA = expected arrival date
 
 # =============================
 # Sidebar – instellingen
 # =============================
 with st.sidebar:
     st.header("⚙️ Instellingen")
-    overstock_pct = st.slider("Overstock-drempel (%)", 5, 50, 20,
-                              help="Percentage boven de 4w-forecast waarbij een product als Overstock telt")
-    # Deze twee zijn optioneel voor uitbreidingen (niet nodig voor benchmarks)
-    target_days = st.slider("Target days of cover", 7, 60, 28,
-                            help="(Optioneel) Niet gebruikt in benchmarks")
-    safety_days = st.slider("Safety buffer (dagen)", 0, 30, 7,
-                            help="(Optioneel) Niet gebruikt in benchmarks")
-
-    st.markdown("---")
-    st.subheader("Imports (optioneel)")
+    # Benchmark instellingen
+    overstock_pct = st.slider("Overstock-drempel (%)", 5, 50, 20, help="Percentage boven de 4w-forecast waarbij een product als Overstock telt")
+    # (oude sliders niet meer nodig voor benchmarks, maar kun je bewaren als je ze elders gebruikt)
+    target_days = st.slider("Target days of cover", 7, 60, 28, help="(Optioneel) Niet meer gebruikt in benchmarks, wel in berekeningen elders")
+    safety_days = st.slider("Safety buffer (dagen)", 0, 30, 7, help="(Optioneel) Niet meer gebruikt in benchmarks, wel in berekeningen elders")
+    st.markdown("—")
+    st.subheader("Imports")
     base_file = st.file_uploader("Upload basisbestand (.xlsx)", type=["xlsx"], key="base")
-    prices_upload = st.file_uploader("Upload prijslijst (xlsx/csv)", type=["xlsx","csv"], key="prices_up")
-    incoming_file = st.file_uploader("Upload inkomende voorraad (xlsx/csv)", type=["xlsx","csv"], key="incoming")
+    prices_file = st.file_uploader("(Optioneel) Prijslijst (.xlsx/.csv)", type=["xlsx","csv"], key="prices")
+    incoming_file = st.file_uploader("(Optioneel) Inkomende voorraad (.xlsx/.csv)", type=["xlsx","csv"], key="incoming")
 
 # =============================
-# Tabs
+# Tabbladen UI
 # =============================
 T1, T2, T3, T4 = st.tabs(["📥 Data & Mapping", "📊 Dashboard", "🧾 Besteloverzicht", "🚚 Inkomend"])
 
@@ -239,7 +275,7 @@ T1, T2, T3, T4 = st.tabs(["📥 Data & Mapping", "📊 Dashboard", "🧾 Bestelo
 with T1:
     st.subheader("1) Basisdata uploaden & kolommen koppelen")
     if base_file is None:
-        st.info("Upload je Excel met minimaal: EAN, Titel, Vrije voorraad, Verkopen (Totaal), Verkoopprognose min (Totaal 4w).")
+        st.info("Upload je Excel met minimaal: EAN, Titel, Vrije voorraad, Verkopen (Totaal), Verkoopprognose min (Totaal 4w)")
     else:
         try:
             sheets = read_excel_all(base_file)
@@ -250,14 +286,12 @@ with T1:
         raw = sheets[sheet]
         st.dataframe(raw.head(10), use_container_width=True)
         auto = auto_map_columns(raw)
-
         st.markdown("**Koppel kolommen**")
-        def pick(lbl, key_name):
+        def pick(lbl, key):
             opts = ["— kies —"] + list(raw.columns)
-            default = auto.get(key_name)
+            default = auto.get(key)
             idx = opts.index(default) if default in opts else 0
             return st.selectbox(lbl, opts, index=idx)
-
         sel = {
             "ean": pick("Kolom voor EAN", "ean"),
             "title": pick("Kolom voor Titel", "title"),
@@ -277,6 +311,7 @@ with T1:
     st.subheader("2) Prijslijst (blijvend in de app – SQLite)")
     st.caption("Je prijzen worden lokaal in de app opgeslagen (prices.db). Geen uploads of downloads nodig.")
 
+    # Knoppen
     c1, c2, c3 = st.columns([1,1,1])
     with c1:
         if st.button("🔄 Herladen uit opslag"):
@@ -294,6 +329,7 @@ with T1:
         if st.button("🆕 Lege prijslijst"):
             st.session_state.prices_df = pd.DataFrame({
                 "EAN": [],
+                "Referentie": [],
                 "Verkoopprijs": [],
                 "Inkoopprijs": [],
                 "Verzendkosten": [],
@@ -303,17 +339,6 @@ with T1:
                 "Levertijd (dagen)": [],
             })
 
-    # Optioneel: snel een bestand inlezen in de editor
-    if prices_upload is not None:
-        try:
-            if prices_upload.name.lower().endswith(".csv"):
-                st.session_state.prices_df = pd.read_csv(prices_upload)
-            else:
-                st.session_state.prices_df = pd.read_excel(prices_upload)
-            st.success("Prijslijst geladen in de editor (nog niet opgeslagen).")
-        except Exception as e:
-            st.error(f"Kon prijslijst niet lezen: {e}")
-
     st.session_state.prices_df = st.data_editor(
         st.session_state.prices_df,
         use_container_width=True,
@@ -321,14 +346,10 @@ with T1:
         key="prices_editor",
     )
 
-    st.caption(
-        "ℹ️ Prijzen worden bewaard in een lokaal databasebestand **prices.db** naast de app. "
-        "In Streamlit Cloud blijft dit meestal behouden tussen herstarts, maar kan verloren gaan bij redeploy/opschalen. "
-        "Voor 100% zekerheid kun je later overschakelen op Google Sheets of een echte database."
-    )
+    st.caption("ℹ️ Prijzen worden bewaard in een lokaal databasebestand **prices.db** naast de app. In Streamlit Cloud blijft dit meestal behouden tussen herstarts, maar kan verloren gaan bij redeploy/opschalen. Voor 100% zekerheid kun je later overschakelen op Google Sheets of een echte database.") en hoef je geen apart systeem te gebruiken.")
 
     st.markdown("---")
-    st.subheader("3) (Optioneel) Inkomende voorraad importeren/bewerken")
+    st.subheader("3) (Optioneel) Inkomende voorraad importeren")
     st.caption("Kolommen: EAN, Aantal, ETA (YYYY-MM-DD), Leverancier")
     if incoming_file is not None:
         try:
@@ -336,7 +357,6 @@ with T1:
                 st.session_state.incoming_df = pd.read_csv(incoming_file)
             else:
                 st.session_state.incoming_df = pd.read_excel(incoming_file)
-            st.success("Inkomende voorraad geladen in de editor.")
         except Exception as e:
             st.error(f"Kon inkomende voorraad niet lezen: {e}")
     st.session_state.incoming_df = st.data_editor(
@@ -346,21 +366,22 @@ with T1:
         key="incoming_editor",
     )
 
-# Utility: merge alles
+# Utility om alles te mergen
+
 def merged_frame():
     if st.session_state.base_df is None:
         return None
     base = st.session_state.base_df.copy()
     prices = st.session_state.prices_df.copy()
     incoming = st.session_state.incoming_df.copy()
-
     # normaliseer types
     for df in [prices, incoming]:
-        if df is not None and not df.empty and "EAN" in df.columns:
+        if df is None or df.empty:
+            continue
+        if "EAN" in df:
             df["EAN"] = df["EAN"].astype(str).str.strip()
     base["EAN"] = base["EAN"].astype(str).str.strip()
-
-    # inkomend (toekomst)
+    # inkomende aantallen per EAN (toekomstige)
     if not incoming.empty and "ETA" in incoming.columns:
         try:
             incoming["ETA"] = pd.to_datetime(incoming["ETA"]).dt.date
@@ -372,20 +393,19 @@ def merged_frame():
         inc_sum = pd.Series(dtype=float)
     base["Incoming"] = base["EAN"].map(inc_sum).fillna(0)
 
-    # prijzen merge
-    cols_prices = [c for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten",
-                               "Leverancier","MOQ","Levertijd (dagen)"] if c in prices.columns]
+    # merge prijzen
+    cols_prices = [c for c in ["Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"] if c in prices.columns]
     if cols_prices:
         base = base.merge(prices[["EAN"]+cols_prices], on="EAN", how="left")
+    # defaulten
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         if c not in base.columns:
             base[c] = 0
     if "Leverancier" not in base.columns:
         base["Leverancier"] = ""
-    # numeriek
+    # type-coercion (robust tegen lege/tekst waardes)
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         base[c] = pd.to_numeric(base[c].astype(str).str.replace(',', '.', regex=False), errors='coerce').fillna(0)
-
     # berekeningen
     base["Voorraadwaarde (verkoop)"] = base["Vrije voorraad"] * base["Verkoopprijs"].fillna(0)
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
@@ -398,35 +418,41 @@ with T2:
     if data is None:
         st.info("Nog geen basisdata. Ga naar **📥 Data & Mapping**.")
     else:
-        # status
+        # status classificatie
         statuses = []
         for _, r in data.iterrows():
+            moq = to_int_safe(r.get("MOQ", 1), 1)
             incoming_qty = to_float_safe(r.get("Incoming", 0), 0)
             statuses.append(classify_status(r, incoming_qty, overstock_pct))
         data["Status"] = statuses
 
-        # KPI's (cards)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Totale voorraadwaarde (verkoop)", f"€ {data['Voorraadwaarde (verkoop)'].sum():,.2f}")
-        c2.metric("Artikelen", len(data))
-        c3.metric("Out of stock", int((data["Status"]=="Out of stock").sum()))
-        c4.metric("At risk", int((data["Status"]=="At risk").sum()))
+        # KPI's
+        c1,c2,c3,c4 = st.columns(4)
+        c1.markdown("<div class='card'><div>Totale voorraadwaarde (verkoop)</div><div class='metric-big'>€ {:,.2f}</div></div>".format(data["Voorraadwaarde (verkoop)"].sum()), unsafe_allow_html=True)
+        c2.markdown("<div class='card'><div>Artikelen</div><div class='metric-big'>{}</div></div>".format(len(data)), unsafe_allow_html=True)
+        c3.markdown("<div class='card'><div>Out of stock</div><div class='metric-big'>{}</div></div>".format((data["Status"]=="Out of stock").sum()), unsafe_allow_html=True)
+        c4.markdown("<div class='card'><div>At risk</div><div class='metric-big'>{}</div></div>".format((data["Status"]=="At risk").sum()), unsafe_allow_html=True)
 
-        # Filter
+        # Filterchips (alleen 4 benchmarks)
         st.write("Filter op status:")
         options = ["Out of stock","At risk","Healthy","Overstock"]
         chosen = st.multiselect(" ", options, default=[], label_visibility="collapsed")
 
-        # aanbeveling
-        data["Aanbevolen bestelaantal"] = data.apply(
-            lambda r: recommend_qty(r, to_float_safe(r.get("Incoming",0),0), to_int_safe(r.get("MOQ",1),1)),
-            axis=1
-        )
+        # eenvoudige bestel-aanbeveling
+        recs = []
+        for _, r in data.iterrows():
+            moq = to_int_safe(r.get("MOQ", 1), 1)
+            incoming_qty = to_float_safe(r.get("Incoming", 0), 0)
+            qty = recommend_qty(r, incoming_qty, moq)
+            recs.append(qty)
+        data["Aanbevolen bestelaantal"] = recs
 
-        view = data[data["Status"].isin(chosen)].copy() if chosen else data.copy()
+        if chosen:
+            view = data[data["Status"].isin(chosen)].copy()
+        else:
+            view = data.copy()
 
-        # Staafdiagram (vaste y-as, geen zoom)
-        st.markdown("**Voorraad gezondheid**")
+        # Gezondheidsdiagram (volgorde vast en vaste y-as, geen zoom)
         order = ["Out of stock","At risk","Healthy","Overstock"]
         health_counts = data["Status"].value_counts().reindex(order).fillna(0)
         health_df = pd.DataFrame({"Status": order, "Aantal": [int(health_counts.get(s,0)) for s in order]})
@@ -442,45 +468,41 @@ with T2:
         )
         st.altair_chart(chart, use_container_width=True)
 
+
         st.markdown("**Producten**")
         display_cols = [
-            "Status","EAN","Titel","Vrije voorraad","Incoming","Verkoopprognose min (Totaal 4w)",
+            "Status","EAN","Referentie","Titel","Vrije voorraad","Incoming","Verkoopprognose min (Totaal 4w)",
             "Aanbevolen bestelaantal","Leverancier","Verkoopprijs","Inkoopprijs","Voorraadwaarde (verkoop)"
         ]
-        for c in display_cols:
-            if c not in view.columns:
-                view[c] = ""
-        st.dataframe(view[display_cols].sort_values(["Status","Aanbevolen bestelaantal"], ascending=[True, False]),
-                     use_container_width=True)
+        missing_cols = [c for c in display_cols if c not in view.columns]
+        for c in missing_cols:
+            view[c] = ""
+        st.dataframe(view[display_cols].sort_values(["Status","Aanbevolen bestelaantal"], ascending=[True,False]), use_container_width=True)
 
-# ---------- T3: Besteloverzicht ----------
+# ---------- T3: Besteloverzicht (PO) ----------
 with T3:
     st.subheader("Maak besteloverzicht / PO")
     data = merged_frame()
     if data is None:
         st.info("Nog geen basisdata. Ga naar **📥 Data & Mapping**.")
     else:
-        data["Aanbevolen bestelaantal"] = data.apply(
-            lambda r: recommend_qty(r, to_float_safe(r.get("Incoming",0),0), to_int_safe(r.get("MOQ",1),1)),
-            axis=1
-        )
+        data["Aanbevolen bestelaantal"] = data.apply(lambda r: recommend_qty(r, to_float_safe(r.get("Incoming",0),0), to_int_safe(r.get("MOQ",1),1)), axis=1)
         df_order = data[data["Aanbevolen bestelaantal"]>0].copy()
         if df_order.empty:
             st.success("Er zijn momenteel geen aanbevelingen om te bestellen.")
         else:
             st.info(f"Er zijn {len(df_order)} regels met een aanbevolen bestelaantal.")
             df_order["Totaal kosten"] = df_order["Aanbevolen bestelaantal"] * df_order["Totale kostprijs per stuk"].fillna(0)
-            st.dataframe(df_order[["Leverancier","EAN","Titel","Aanbevolen bestelaantal",
-                                   "Totale kostprijs per stuk","Totaal kosten"]],
-                         use_container_width=True)
+            st.dataframe(df_order[["Leverancier","EAN","Referentie","Titel","Aanbevolen bestelaantal","Totale kostprijs per stuk","Totaal kosten"]], use_container_width=True)
 
+            # Exporteer per leverancier
             suppliers = sorted(df_order["Leverancier"].fillna("").unique())
             sup = st.selectbox("Kies leverancier voor export", suppliers)
             df_sup = df_order[df_order["Leverancier"]==sup].copy() if sup else df_order.copy()
             if df_sup.empty:
                 st.warning("Geen regels voor deze leverancier.")
             else:
-                po_cols = ["EAN","Titel","Aanbevolen bestelaantal","Totale kostprijs per stuk","Totaal kosten"]
+                po_cols = ["EAN","Referentie","Titel","Aanbevolen bestelaantal","Totale kostprijs per stuk","Totaal kosten"]
                 excel_buf = io.BytesIO()
                 with pd.ExcelWriter(excel_buf, engine="openpyxl") as w:
                     df_sup[po_cols].to_excel(w, index=False, sheet_name="Bestelling")
@@ -497,7 +519,7 @@ with T3:
                     mime="text/csv",
                 )
 
-# ---------- T4: Inkomend ----------
+# ---------- T4: Inkomende voorraad ----------
 with T4:
     st.subheader("Inkomende zendingen")
     inc = st.session_state.incoming_df.copy()
@@ -509,7 +531,7 @@ with T4:
         except Exception:
             pass
         st.dataframe(inc, use_container_width=True)
-
+        # Samenvatting komende 30 dagen
         st.markdown("**Samenvatting komende 30 dagen**")
         try:
             inc_dt = inc.copy()
