@@ -5,6 +5,8 @@ import io
 import re
 from datetime import date, timedelta
 import altair as alt
+import sqlite3
+import os
 
 # =============================
 # Pagina-setup & CSS (simple theming)
@@ -147,12 +149,102 @@ def recommend_qty(row, incoming_qty, moq=1):
     return need_rounded
 
 # =============================
+# SQLite – eenvoudige lokale opslag voor prijzen (1 bestand in app-map)
+# =============================
+DB_PATH = os.path.join(os.getcwd(), "prices.db")
+
+def _get_db_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
+
+def init_prices_table():
+    conn = _get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prices (
+            EAN TEXT PRIMARY KEY,
+            Verkoopprijs REAL DEFAULT 0,
+            Inkoopprijs REAL DEFAULT 0,
+            Verzendkosten REAL DEFAULT 0,
+            Overige_kosten REAL DEFAULT 0,
+            Leverancier TEXT DEFAULT '',
+            MOQ INTEGER DEFAULT 1,
+            Levertijd_dagen INTEGER DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+@st.cache_data(show_spinner=False)
+def load_prices_from_db() -> pd.DataFrame:
+    init_prices_table()
+    conn = _get_db_conn()
+    df = pd.read_sql_query(
+        "SELECT EAN, Verkoopprijs, Inkoopprijs, Verzendkosten, Overige_kosten AS 'Overige kosten', Leverancier, MOQ, Levertijd_dagen AS 'Levertijd (dagen)' FROM prices",
+        conn,
+    )
+    conn.close()
+    if df.empty:
+        df = pd.DataFrame(columns=["EAN","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"])
+    # type coercion
+    for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df["EAN"] = df["EAN"].astype(str).str.strip()
+    return df
+
+def save_prices_to_db(df: pd.DataFrame):
+    init_prices_table()
+    # normaliseer kolomnamen
+    expected = ["EAN","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
+    for c in expected:
+        if c not in df.columns:
+            df[c] = "" if c == "Leverancier" else 0
+    df = df[expected].copy()
+    df["EAN"] = df["EAN"].astype(str).str.strip()
+    for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(',', '.', regex=False), errors='coerce').fillna(0)
+    # schrijven
+    conn = _get_db_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM prices")
+    rows = [
+        (
+            r.EAN,
+            float(r["Verkoopprijs"]),
+            float(r["Inkoopprijs"]),
+            float(r["Verzendkosten"]),
+            float(r["Overige kosten"]),
+            str(r["Leverancier"] or ""),
+            int(r["MOQ"] or 1),
+            int(r["Levertijd (dagen)"] or 0),
+        )
+        for _, r in df.iterrows()
+        if str(r["EAN"]).strip() != ""
+    ]
+    cur.executemany(
+        """
+        INSERT OR REPLACE INTO prices
+        (EAN, Verkoopprijs, Inkoopprijs, Verzendkosten, Overige_kosten, Leverancier, MOQ, Levertijd_dagen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+# =============================
 # STATE-init
 # =============================
 if "base_df" not in st.session_state:
     st.session_state.base_df = None
 if "prices_df" not in st.session_state:
-    st.session_state.prices_df = pd.DataFrame(columns=["EAN","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"])
+    # Laad direct uit lokale database (SQLite) zodat prijzen blijven bewaard
+    try:
+        st.session_state.prices_df = load_prices_from_db()
+    except Exception:
+        st.session_state.prices_df = pd.DataFrame(columns=["EAN","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"])
 if "incoming_df" not in st.session_state:
     st.session_state.incoming_df = pd.DataFrame(columns=["EAN","Aantal","ETA","Leverancier"])  # ETA = expected arrival date
 
@@ -214,26 +306,44 @@ with T1:
                 st.success("Basisdata opgeslagen.")
 
     st.markdown("---")
-    st.subheader("2) (Optioneel) Prijslijst toevoegen of bewerken")
-    st.caption("Kolommen: EAN, Verkoopprijs, Inkoopprijs, Verzendkosten, Overige kosten, Leverancier, MOQ, Levertijd (dagen)")
-    if prices_file is not None:
-        try:
-            if prices_file.name.lower().endswith(".csv"):
-                st.session_state.prices_df = pd.read_csv(prices_file)
-            else:
-                st.session_state.prices_df = pd.read_excel(prices_file)
-        except Exception as e:
-            st.error(f"Kon prijslijst niet lezen: {e}")
+    st.subheader("2) Prijslijst (blijvend in de app – SQLite)")
+    st.caption("Je prijzen worden lokaal in de app opgeslagen (prices.db). Geen uploads of downloads nodig.")
+
+    # Knoppen
+    c1, c2, c3 = st.columns([1,1,1])
+    with c1:
+        if st.button("🔄 Herladen uit opslag"):
+            st.session_state.prices_df = load_prices_from_db()
+            st.success("Prijzen herladen uit opslag.")
+    with c2:
+        if st.button("💾 Opslaan in opslag", type="primary"):
+            try:
+                save_prices_to_db(st.session_state.prices_df.copy())
+                st.success("Prijzen opgeslagen in de app (SQLite).")
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"Opslaan mislukt: {e}")
+    with c3:
+        if st.button("🆕 Lege prijslijst"):
+            st.session_state.prices_df = pd.DataFrame({
+                "EAN": [],
+                "Verkoopprijs": [],
+                "Inkoopprijs": [],
+                "Verzendkosten": [],
+                "Overige kosten": [],
+                "Leverancier": [],
+                "MOQ": [],
+                "Levertijd (dagen)": [],
+            })
+
     st.session_state.prices_df = st.data_editor(
         st.session_state.prices_df,
         use_container_width=True,
         num_rows="dynamic",
         key="prices_editor",
     )
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        st.session_state.prices_df.to_excel(w, index=False)
-    st.download_button("💾 Download prijslijst", buf.getvalue(), "prijslijst.xlsx")
+
+    st.caption("ℹ️ Prijzen worden bewaard in een lokaal databasebestand **prices.db** naast de app. In Streamlit Cloud blijft dit meestal behouden tussen herstarts, maar kan verloren gaan bij redeploy/opschalen. Voor 100% zekerheid kun je later overschakelen op Google Sheets of een echte database.") en hoef je geen apart systeem te gebruiken.")
 
     st.markdown("---")
     st.subheader("3) (Optioneel) Inkomende voorraad importeren")
