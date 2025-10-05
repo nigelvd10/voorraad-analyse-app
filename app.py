@@ -19,7 +19,8 @@ st.markdown(
     .chip.orange{background:#ffe8d6;border-color:#ffc38a}
     .chip.green{background:#e6ffe9;border-color:#b3ffbf}
     .chip.gray{background:#f2f2f2;border-color:#e0e0e0}
-    .card{background:#fff;border:1px solid #eee;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+    .card{background:#fff;border:1px solid #eee;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 1px 2px rgba(0,0,0,.03); color:#111}
+    .card .metric-big{color:#111}
     .metric-big{font-size:28px;font-weight:700}
     </style>
     """,
@@ -105,33 +106,36 @@ def build_base(df_raw, sel):
     return df[REQUIRED_ORDER]
 
 
-def classify_status(row, target_days, safety_days, incoming_qty):
-    daily_rate = (row["Verkoopprognose min (Totaal 4w)"] / 28.0) if row["Verkoopprognose min (Totaal 4w)"] > 0 else 0
-    stock = float(row["Vrije voorraad"]) + float(incoming_qty)
-    if stock <= 0:
+def classify_status(row, incoming_qty):
+    """Classificatie o.b.v. vergelijking van (voorraad + incoming) met 4w-forecast.
+    Regels:
+    - Overstock: >= 120% van forecast
+    - Out of stock: totale voorraad <= 0
+    - Healthy: tussen 100% en 120% van forecast (inclusief exact forecast)
+    - At risk: < 100% van forecast (maar > 0 voorraad)
+    - Als forecast <= 0: Healthy (tenzij voorraad <= 0 → Out of stock)
+    """
+    f = float(row.get("Verkoopprognose min (Totaal 4w)", 0) or 0)
+    stock_total = float(row.get("Vrije voorraad", 0) or 0) + float(incoming_qty or 0)
+    if stock_total <= 0:
         return "Out of stock"
-    if daily_rate == 0:
-        return "Healthy"  # geen verbruik bekend -> niet alarmeren
-    cover_days = stock / daily_rate
-    # drempels
-    if cover_days < safety_days:
-        return "Overdue"  # onder safety -> acuut
-    elif cover_days < target_days:
-        return "At risk"
-    elif cover_days > target_days * 2.0:
-        return "Overstock"
-    else:
+    if f <= 0:
         return "Healthy"
+    if stock_total < f:
+        return "At risk"
+    if stock_total >= 1.2 * f:
+        return "Overstock"
+    return "Healthy"
 
 
-def recommend_qty(row, target_days, safety_days, incoming_qty, moq=1):
-    daily_rate = (row["Verkoopprognose min (Totaal 4w)"] / 28.0) if row["Verkoopprognose min (Totaal 4w)"] > 0 else 0
-    if daily_rate == 0:
+def recommend_qty(row, incoming_qty, moq=1):
+    # Simpele aanbeveling: bestel tot 110% van forecast (4w) als je onder forecast zit
+    f = float(row.get("Verkoopprognose min (Totaal 4w)", 0) or 0)
+    stock_total = float(row.get("Vrije voorraad", 0) or 0) + float(incoming_qty or 0)
+    if f <= 0:
         return 0
-    target_stock = daily_rate * (target_days + safety_days)
-    current = float(row["Vrije voorraad"]) + float(incoming_qty)
-    need = max(0.0, target_stock - current)
-    # rond op MOQ
+    target = 1.1 * f  # klein buffer
+    need = max(0.0, target - stock_total)
     need_rounded = int(np.ceil(need / max(1, moq)) * max(1, moq))
     return need_rounded
 
@@ -296,7 +300,7 @@ with T2:
         for _, r in data.iterrows():
             moq = to_int_safe(r.get("MOQ", 1), 1)
             incoming_qty = to_float_safe(r.get("Incoming", 0), 0)
-            statuses.append(classify_status(r, target_days, safety_days, incoming_qty))
+            statuses.append(classify_status(r, incoming_qty))
         data["Status"] = statuses
 
         # KPI's
@@ -304,35 +308,33 @@ with T2:
         c1.markdown("<div class='card'><div>Totale voorraadwaarde (verkoop)</div><div class='metric-big'>€ {:,.2f}</div></div>".format(data["Voorraadwaarde (verkoop)"].sum()), unsafe_allow_html=True)
         c2.markdown("<div class='card'><div>Artikelen</div><div class='metric-big'>{}</div></div>".format(len(data)), unsafe_allow_html=True)
         c3.markdown("<div class='card'><div>Out of stock</div><div class='metric-big'>{}</div></div>".format((data["Status"]=="Out of stock").sum()), unsafe_allow_html=True)
-        c4.markdown("<div class='card'><div>Te bestellen (aanbevolen qty > 0)</div><div class='metric-big'>{}</div></div>".format(0), unsafe_allow_html=True)
+        c4.markdown("<div class='card'><div>At risk</div><div class='metric-big'>{}</div></div>".format((data["Status"]=="At risk").sum()), unsafe_allow_html=True)
 
-        # chips
+        # Filterchips (alleen 4 benchmarks)
         st.write("Filter op status:")
-        chosen = st.multiselect(" ", ["Out of stock","Overdue","At risk","Reorder","Overstock","Healthy"], default=[], label_visibility="collapsed")
+        options = ["Out of stock","At risk","Healthy","Overstock"]
+        chosen = st.multiselect(" ", options, default=[], label_visibility="collapsed")
 
-        # bereken recommendaties
+        # eenvoudige bestel-aanbeveling
         recs = []
         for _, r in data.iterrows():
             moq = to_int_safe(r.get("MOQ", 1), 1)
             incoming_qty = to_float_safe(r.get("Incoming", 0), 0)
-            qty = recommend_qty(r, target_days, safety_days, incoming_qty, moq)
+            qty = recommend_qty(r, incoming_qty, moq)
             recs.append(qty)
         data["Aanbevolen bestelaantal"] = recs
-        data.loc[data["Status"].isin(["Overdue","At risk"]) & (data["Aanbevolen bestelaantal"]>0), "Status"] = data.loc[data["Status"].isin(["Overdue","At risk"]) & (data["Aanbevolen bestelaantal"]>0), "Status"].replace({"At risk":"Reorder"})
-
-        # update KPI bestelbaar
-        to_order_count = (data["Aanbevolen bestelaantal"]>0).sum()
-        st.session_state["_to_order_count"] = int(to_order_count)
 
         if chosen:
             view = data[data["Status"].isin(chosen)].copy()
         else:
             view = data.copy()
 
-        # Gezondheidsdiagram
+        # Gezondheidsdiagram (volgorde vast)
         st.markdown("**Voorraad gezondheid**")
-        health_counts = data["Status"].value_counts().reindex(["Out of stock","Overdue","At risk","Reorder","Overstock","Healthy"]).fillna(0)
+        order = ["Out of stock","At risk","Healthy","Overstock"]
+        health_counts = data["Status"].value_counts().reindex(order).fillna(0)
         st.bar_chart(health_counts)
+
 
         st.markdown("**Producten**")
         display_cols = [
@@ -351,7 +353,7 @@ with T3:
     if data is None:
         st.info("Nog geen basisdata. Ga naar **📥 Data & Mapping**.")
     else:
-        data["Aanbevolen bestelaantal"] = data.apply(lambda r: recommend_qty(r, target_days, safety_days, to_float_safe(r.get("Incoming",0),0), to_int_safe(r.get("MOQ",1),1)), axis=1)
+        data["Aanbevolen bestelaantal"] = data.apply(lambda r: recommend_qty(r, to_float_safe(r.get("Incoming",0),0), to_int_safe(r.get("MOQ",1),1)), axis=1)
         df_order = data[data["Aanbevolen bestelaantal"]>0].copy()
         if df_order.empty:
             st.success("Er zijn momenteel geen aanbevelingen om te bestellen.")
