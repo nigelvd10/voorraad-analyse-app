@@ -6,27 +6,22 @@ import altair as alt
 import sqlite3, os, re
 from datetime import date, timedelta
 
-# =============================
-# App-setup & wat stijl
-# =============================
+# ============== App setup & stijl ==============
 st.set_page_config(page_title="Voorraad App", layout="wide")
+st.title("")
 
 SIDEBAR_CSS = """
 <style>
-/* Sidebar look */
 section[data-testid="stSidebar"] {background:#201915;color:#fff;}
 .sidebar-title {font-size:28px;font-weight:700;margin:8px 0 16px 4px;color:#fff;}
 .nav-btn {display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;margin:6px 6px;color:#eee;text-decoration:none;font-size:18px;}
 .nav-btn:hover {background:rgba(255,255,255,.06);}
 .nav-active {background:#3a2f27;color:#fff;}
-.nav-icon {width:22px;text-align:center;}
 </style>
 """
 st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
-# =============================
-# Helpers
-# =============================
+# ============== Helpers ==============
 def to_num(x):
     return pd.to_numeric(pd.Series(x).astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
@@ -90,16 +85,13 @@ def build_base(df_raw, sel):
     })
     return df[REQ_ORDER]
 
-# =============================
-# SQLite opslag (blijvend)
-# =============================
+# ============== SQLite opslag ==============
 DB_PATH = os.path.join(os.getcwd(), "app_data.db")
-def db():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+def db(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
-    c = db(); cur = c.cursor()
-    # prijzen/inventory-extra
+    c=db(); cur=c.cursor()
+    # prijzen/inventory
     cur.execute("""
     CREATE TABLE IF NOT EXISTS prices (
         EAN TEXT PRIMARY KEY,
@@ -112,12 +104,14 @@ def init_db():
         MOQ INTEGER DEFAULT 1,
         Levertijd_dagen INTEGER DEFAULT 0
     )""")
-    # suppliers
+    # suppliers (uitgebreid)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS suppliers (
         Naam TEXT PRIMARY KEY,
         Locatie TEXT DEFAULT '',
-        Levertijd_dagen INTEGER DEFAULT 0
+        Productietijd_dagen INTEGER DEFAULT 0,
+        Levertijd_zee_dagen INTEGER DEFAULT 0,
+        Levertijd_lucht_dagen INTEGER DEFAULT 0
     )""")
     # incoming
     cur.execute("""
@@ -132,37 +126,36 @@ def init_db():
     )""")
     c.commit(); c.close()
 
+# prijzen
 @st.cache_data(show_spinner=False)
 def load_prices():
     init_db()
-    c = db()
-    df = pd.read_sql_query(
+    c=db()
+    df=pd.read_sql_query(
         "SELECT EAN, Referentie, Verkoopprijs, Inkoopprijs, Verzendkosten, "
-        "Overige_kosten AS 'Overige kosten', Leverancier, MOQ, Levertijd_dagen AS 'Levertijd (dagen)' "
-        "FROM prices", c)
+        "Overige_kosten AS 'Overige kosten', Leverancier, MOQ, Levertijd_dagen AS 'Levertijd (dagen)' FROM prices", c)
     c.close()
     if df.empty:
-        df = pd.DataFrame(columns=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten",
-                                   "Overige kosten","Leverancier","MOQ","Levertijd (dagen)"])
+        df=pd.DataFrame(columns=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten",
+                                 "Overige kosten","Leverancier","MOQ","Levertijd (dagen)"])
     for col in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    df["EAN"] = df["EAN"].astype(str).str.strip()
-    df["Referentie"] = df.get("Referentie","").astype(str).str.strip()
+        df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df["EAN"]=df["EAN"].astype(str).str.strip()
+    df["Referentie"]=df.get("Referentie","").astype(str).str.strip()
     return df
 
 def save_prices(df):
     init_db()
-    need = ["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
-    for c in need:
-        if c not in df.columns:
-            df[c] = "" if c in ["Referentie","Leverancier"] else 0
-    df = df[need].copy()
-    df["EAN"] = df["EAN"].astype(str).str.strip()
-    df["Referentie"] = df["Referentie"].astype(str).str.strip()
-    for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
-        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
+    need=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
+    for c_ in need:
+        if c_ not in df.columns: df[c_]="" if c_ in ["Referentie","Leverancier"] else 0
+    df=df[need].copy()
+    df["EAN"]=df["EAN"].astype(str).str.strip()
+    df["Referentie"]=df["Referentie"].astype(str).str.strip()
+    for c_ in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
+        df[c_]=pd.to_numeric(df[c_].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
-    c = db(); cur = c.cursor()
+    c=db(); cur=c.cursor()
     cur.execute("DELETE FROM prices")
     cur.executemany("""
         INSERT OR REPLACE INTO prices
@@ -172,52 +165,69 @@ def save_prices(df):
         (r.EAN, str(r["Referentie"] or ""), float(r["Verkoopprijs"]), float(r["Inkoopprijs"]),
          float(r["Verzendkosten"]), float(r["Overige kosten"]), str(r["Leverancier"] or ""),
          int(r["MOQ"] or 1), int(r["Levertijd (dagen)"] or 0))
-        for _, r in df.iterrows() if str(r["EAN"]).strip() != ""
+        for _, r in df.iterrows() if str(r["EAN"]).strip()!=""
     ])
     c.commit(); c.close()
     st.cache_data.clear()
 
+# suppliers
 @st.cache_data(show_spinner=False)
 def load_suppliers():
     init_db()
-    c = db()
-    df = pd.read_sql_query("SELECT Naam, Locatie, Levertijd_dagen AS 'Levertijd (dagen)' FROM suppliers", c)
+    c=db()
+    df=pd.read_sql_query(
+        "SELECT Naam, Locatie, Productietijd_dagen AS 'Productietijd (dagen)', "
+        "Levertijd_zee_dagen AS 'Levertijd zee (dagen)', "
+        "Levertijd_lucht_dagen AS 'Levertijd lucht (dagen)' "
+        "FROM suppliers", c)
     c.close()
     if df.empty:
-        df = pd.DataFrame(columns=["Naam","Locatie","Levertijd (dagen)"])
-    df["Levertijd (dagen)"] = pd.to_numeric(df["Levertijd (dagen)"], errors="coerce").fillna(0).astype(int)
+        df=pd.DataFrame(columns=["Naam","Locatie","Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"])
+    for col in ["Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"]:
+        df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
 def save_suppliers(df):
     init_db()
-    need=["Naam","Locatie","Levertijd (dagen)"]
-    for c in need:
-        if c not in df.columns: df[c] = "" if c!="Levertijd (dagen)" else 0
-    df = df[need].copy()
-    df["Naam"] = df["Naam"].astype(str).str.strip()
-    df["Locatie"] = df["Locatie"].astype(str).str.strip()
-    df["Levertijd (dagen)"] = pd.to_numeric(df["Levertijd (dagen)"], errors="coerce").fillna(0).astype(int)
+    need=["Naam","Locatie","Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"]
+    for c_ in need:
+        if c_ not in df.columns: df[c_]=""
+    df=df[need].copy()
+    df["Naam"]=df["Naam"].astype(str).str.strip()
+    df["Locatie"]=df["Locatie"].astype(str).str.strip()
+    for col in ["Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"]:
+        df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-    c = db(); cur = c.cursor()
+    c=db(); cur=c.cursor()
     cur.execute("DELETE FROM suppliers")
-    cur.executemany("INSERT OR REPLACE INTO suppliers (Naam, Locatie, Levertijd_dagen) VALUES (?, ?, ?)",
-                    [(r.Naam, r.Locatie, int(r["Levertijd (dagen)"])) for _, r in df.iterrows() if r.Naam])
+    cur.executemany(
+        "INSERT OR REPLACE INTO suppliers (Naam, Locatie, Productietijd_dagen, Levertijd_zee_dagen, Levertijd_lucht_dagen) VALUES (?, ?, ?, ?, ?)",
+        [(r.Naam, r.Locatie, int(r["Productietijd (dagen)"]), int(r["Levertijd zee (dagen)"]), int(r["Levertijd lucht (dagen)"]))
+         for _, r in df.iterrows() if r.Naam]
+    )
     c.commit(); c.close()
     st.cache_data.clear()
 
+def delete_supplier(name: str):
+    c=db(); cur=c.cursor()
+    cur.execute("DELETE FROM suppliers WHERE Naam=?", (name,))
+    c.commit(); c.close()
+    st.cache_data.clear()
+
+# incoming
 @st.cache_data(show_spinner=False)
 def load_incoming():
     init_db()
-    c = db()
-    df = pd.read_sql_query("SELECT id, EAN, Referentie, Aantal, ETA, Leverancier, Opmerking FROM incoming", c)
+    c=db()
+    df=pd.read_sql_query("SELECT id, EAN, Referentie, Aantal, ETA, Leverancier, Opmerking FROM incoming", c)
     c.close()
     if df.empty:
-        df = pd.DataFrame(columns=["id","EAN","Referentie","Aantal","ETA","Leverancier","Opmerking"])
+        df=pd.DataFrame(columns=["id","EAN","Referentie","Aantal","ETA","Leverancier","Opmerking"])
     return df
 
 def add_incoming_row(ean, ref, qty, eta, leverancier, note):
     init_db()
-    c = db(); cur = c.cursor()
+    c=db(); cur=c.cursor()
     cur.execute("INSERT INTO incoming (EAN, Referentie, Aantal, ETA, Leverancier, Opmerking) VALUES (?, ?, ?, ?, ?, ?)",
                 (str(ean).strip(), str(ref or ""), int(qty or 0), str(eta) if eta else "", str(leverancier or ""), str(note or "")))
     c.commit(); c.close()
@@ -229,9 +239,7 @@ def delete_incoming_row(row_id: int):
     c.commit(); c.close()
     st.cache_data.clear()
 
-# =============================
-# Basisdata (upload) in memory
-# =============================
+# ============== Basisdata upload-memory ==============
 if "base_df" not in st.session_state:
     st.session_state.base_df = None
 
@@ -263,9 +271,7 @@ def upload_base_ui():
         except Exception as e:
             st.error(f"Kon Excel niet lezen: {e}")
 
-# =============================
-# Merge helper
-# =============================
+# ============== Merge helper ==============
 def merged_inventory():
     base = st.session_state.base_df
     if base is None: return None
@@ -275,11 +281,8 @@ def merged_inventory():
 
     base["EAN"] = base["EAN"].astype(str).str.strip()
     if not incoming.empty:
-        # alleen komende of zonder datum
-        try:
-            incoming["ETA"] = pd.to_datetime(incoming["ETA"]).dt.date
-        except Exception:
-            pass
+        try: incoming["ETA"] = pd.to_datetime(incoming["ETA"]).dt.date
+        except Exception: pass
         future = incoming[incoming["ETA"].isna() | (incoming["ETA"] >= date.today())]
         inc_sum = future.groupby("EAN")["Aantal"].sum(min_count=1).fillna(0)
     else:
@@ -300,9 +303,7 @@ def merged_inventory():
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
     return base
 
-# =============================
-# Benchmarks (4 cat + slider)
-# =============================
+# ============== Benchmarks + recommend ==============
 def classify(row, overstock_pct):
     f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
     stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
@@ -322,33 +323,26 @@ def recommend(row):
     moq = to_int(row.get("MOQ",1),1)
     return int(np.ceil(need / max(1, moq)) * max(1, moq))
 
-# =============================
-# Sidebar navigatie
-# =============================
+# ============== Sidebar navigatie ==============
 with st.sidebar:
     st.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
     pages = ["Home","Inventory","Suppliers","Incoming"]
-    icons = {"Home":"🏠","Inventory":"📦","Suppliers":"👥","Incoming":"⬇️"}
-    choice = st.session_state.get("_page", "Home")
+    choice = st.session_state.get("_page","Home")
     for p in pages:
         cls = "nav-btn nav-active" if p==choice else "nav-btn"
-        if st.button(f'{icons[p]}  {p}', key=f'nav_{p}', use_container_width=True):
+        if st.button(p, key=f'nav_{p}', use_container_width=True):
             choice = p
     st.session_state["_page"] = choice
 
-# =============================
-# Pagina's
-# =============================
+# ============== Pagina's ==============
 if choice == "Home":
-    st.header("Dashboard")
+    st.header("Home")
     if st.session_state.base_df is None:
         st.info("Nog geen basisdata geladen. Upload hieronder.")
         upload_base_ui()
     inv = merged_inventory()
-    if inv is None:
-        st.stop()
-    inv["Status"] = inv.apply(lambda r: classify(r, st.sidebar.slider if False else st.session_state.get("overstock_pct",20)), axis=1)  # dummy to keep cache happy
-    # echte slider in main:
+    if inv is None: st.stop()
+
     over_pct = st.slider("Overstock-drempel (%)", 5, 50, 20)
     inv["Status"] = inv.apply(lambda r: classify(r, over_pct), axis=1)
 
@@ -371,7 +365,8 @@ if choice == "Home":
 
     st.markdown("**Toplijst (aanbevolen bestelaantal)**")
     inv["Aanbevolen bestelaantal"] = inv.apply(recommend, axis=1)
-    st.dataframe(inv[["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming","Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]]
+    st.dataframe(inv[["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
+                      "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]]
                  .sort_values(["Aanbevolen bestelaantal"], ascending=False), use_container_width=True)
 
 elif choice == "Inventory":
@@ -381,24 +376,17 @@ elif choice == "Inventory":
         upload_base_ui()
     inv = merged_inventory()
     if inv is not None:
-        # Editor voor prijzen
         st.subheader("Prijzen & parameters (blijvend opslaan)")
         prices = load_prices()
-        prices = st.data_editor(
-            prices,
-            key="prices_editor_table",
-            num_rows="dynamic",
-            use_container_width=True
-        )
+        prices = st.data_editor(prices, key="prices_editor_table", num_rows="dynamic", use_container_width=True)
         col1,col2 = st.columns([1,1])
         with col1:
             if st.button("💾 Opslaan prijzen", type="primary"):
-                save_prices(prices)
-                st.success("Prijzen opgeslagen.")
+                save_prices(prices); st.success("Prijzen opgeslagen.")
         with col2:
             if st.button("🔄 Herladen prijzen"):
-                st.cache_data.clear()
-                st.experimental_rerun()
+                st.cache_data.clear(); st.experimental_rerun()
+
         st.markdown("---")
         st.subheader("Overzicht producten")
         show_cols = ["EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)",
@@ -410,32 +398,43 @@ elif choice == "Inventory":
 elif choice == "Suppliers":
     st.header("Suppliers")
     sup = load_suppliers()
+
+    # Toevoegen
     with st.form("new_supplier"):
         st.subheader("Nieuwe leverancier toevoegen")
         naam = st.text_input("Naam *")
         locatie = st.text_input("Locatie")
-        levertijd = st.number_input("Levertijd (dagen)", min_value=0, value=0, step=1)
+        prod = st.number_input("Gem. productietijd (dagen)", min_value=0, value=0, step=1)
+        sea = st.number_input("Levertijd (zee, dagen)", min_value=0, value=0, step=1)
+        air = st.number_input("Levertijd (lucht, dagen)", min_value=0, value=0, step=1)
         submitted = st.form_submit_button("Toevoegen")
         if submitted:
             if not naam.strip():
                 st.warning("Naam is verplicht.")
             else:
-                # voeg/overschrijf in df en sla
                 exists = (sup["Naam"].str.lower()==naam.strip().lower()).any()
+                new_row = {"Naam":naam.strip(),"Locatie":locatie,
+                           "Productietijd (dagen)":int(prod),
+                           "Levertijd zee (dagen)":int(sea),
+                           "Levertijd lucht (dagen)":int(air)}
                 if exists:
-                    sup.loc[sup["Naam"].str.lower()==naam.strip().lower(), ["Locatie","Levertijd (dagen)"]] = [locatie, levertijd]
+                    sup.loc[sup["Naam"].str.lower()==naam.strip().lower(), :] = new_row
                 else:
-                    sup = pd.concat([sup, pd.DataFrame([{"Naam":naam.strip(),"Locatie":locatie,"Levertijd (dagen)":int(levertijd)}])], ignore_index=True)
-                save_suppliers(sup)
-                st.success("Leverancier opgeslagen.")
-                st.cache_data.clear()
+                    sup = pd.concat([sup, pd.DataFrame([new_row])], ignore_index=True)
+                save_suppliers(sup); st.success("Leverancier opgeslagen."); st.cache_data.clear()
 
+    # Bewerken + verwijderen
     st.subheader("Leverancierslijst (bewerken mogelijk)")
     sup_edit = st.data_editor(sup, num_rows="dynamic", use_container_width=True, key="sup_editor")
-    if st.button("💾 Opslaan wijzigingen", type="primary"):
-        save_suppliers(sup_edit)
-        st.success("Leveranciers opgeslagen.")
-        st.cache_data.clear()
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("💾 Opslaan wijzigingen", type="primary"):
+            save_suppliers(sup_edit); st.success("Leveranciers opgeslagen."); st.cache_data.clear()
+    with c2:
+        del_name = st.selectbox("Verwijderen: kies leverancier", ["—"] + sup_edit["Naam"].astype(str).tolist())
+        if st.button("🗑️ Verwijder geselecteerde"):
+            if del_name and del_name != "—":
+                delete_supplier(del_name); st.success(f"'{del_name}' verwijderd."); st.cache_data.clear()
 
 elif choice == "Incoming":
     st.header("Incoming")
@@ -461,18 +460,14 @@ elif choice == "Incoming":
         st.info("Nog geen inkomende zendingen.")
     else:
         inc_display = inc.copy()
-        try:
-            inc_display["ETA"] = pd.to_datetime(inc_display["ETA"]).dt.date
-        except Exception:
-            pass
-        st.dataframe(inc_display.drop(columns=["id"]), use_container_width=True)
+        try: inc_display["ETA"] = pd.to_datetime(inc_display["ETA"]).dt.date
+        except Exception: pass
+        st.dataframe(inc_display, use_container_width=True)
 
         st.markdown("Rij verwijderen")
-        del_id = st.number_input("ID (zie linkerkolom in tabel)", min_value=0, step=1, value=0)
-        if st.button("🗑️ Verwijder geselecteerd ID"):
+        del_id = st.number_input("ID (zie kolom 'id')", min_value=0, step=1, value=0)
+        if st.button("🗑️ Verwijder ID"):
             if del_id>0 and (inc["id"]==del_id).any():
-                delete_incoming_row(int(del_id))
-                st.success("Verwijderd.")
+                delete_incoming_row(int(del_id)); st.success("Verwijderd."); st.cache_data.clear()
             else:
                 st.warning("Onbekend ID.")
-
