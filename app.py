@@ -1,4 +1,4 @@
-# app.py — autosave op eerste wijziging (Inventory + Home)
+# app.py — robuuste autosave (zet sessie-waarde altijd om naar DataFrame)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -37,6 +37,43 @@ def df_hash(df: pd.DataFrame, cols=None) -> str:
     d = df if cols is None else df[cols]
     b = d.to_csv(index=False).encode()
     return hashlib.md5(b).hexdigest()
+
+def ensure_df(obj, expected_cols=None) -> pd.DataFrame:
+    """Zet session_state waarde (df/dict/list/None) veilig om naar DataFrame en vul ontbrekende kolommen aan."""
+    if isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+    elif isinstance(obj, dict):
+        # kan een kolom->lijst dict zijn of een speciale structuur; probeer DataFrame
+        try:
+            df = pd.DataFrame(obj)
+        except Exception:
+            # misschien {index: {col: val}}
+            try:
+                df = pd.DataFrame.from_dict(obj, orient="index")
+            except Exception:
+                df = pd.DataFrame()
+    elif isinstance(obj, list):
+        # lijst van dicts of waarden -> DataFrame
+        try:
+            df = pd.DataFrame(obj)
+        except Exception:
+            df = pd.DataFrame()
+    else:
+        df = pd.DataFrame()
+
+    if expected_cols:
+        for c in expected_cols:
+            if c not in df.columns:
+                # vul met lege of 0 afhankelijk van kolom
+                if c in ["Referentie", "Leverancier"]:
+                    df[c] = ""
+                elif c in ["EAN"]:
+                    df[c] = ""
+                else:
+                    df[c] = 0
+        # volgorde forceren
+        df = df[expected_cols]
+    return df
 
 # ============ Kolom herkenning (incl. Referentie) ============ #
 PATTERNS = {
@@ -172,10 +209,8 @@ def load_prices():
 def save_prices(df):
     init_db()
     need=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
-    for c in need:
-        if c not in df.columns:
-            df[c] = "" if c in ["Referentie","Leverancier"] else 0
-    df=df[need].copy()
+    # maak veilig
+    df = ensure_df(df, need)
     df["EAN"]=df["EAN"].astype(str).str.strip()
     df["Referentie"]=df["Referentie"].astype(str).str.strip()
     df["Leverancier"]=df["Leverancier"].astype(str).str.strip()
@@ -214,9 +249,7 @@ def load_suppliers():
 def save_suppliers(df):
     init_db()
     need=["Naam","Locatie","Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"]
-    for c in need:
-        if c not in df.columns: df[c] = "" if c != "Productietijd (dagen)" else 0
-    df=df[need].copy()
+    df = ensure_df(df, need)
     df["Naam"]=df["Naam"].astype(str).str.strip()
     df["Locatie"]=df["Locatie"].astype(str).str.strip()
     for col in ["Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"]:
@@ -275,6 +308,7 @@ def load_base_df():
 
 def save_base_df(df):
     init_db()
+    df = ensure_df(df, REQ_ORDER)
     c=db(); cur=c.cursor()
     cur.execute("DELETE FROM base_data")
     cur.executemany("""
@@ -407,10 +441,12 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
-# ======== CALLBACKS (directe opslag op eerste wijziging) ======== #
+# ======== CALLBACKS (directe opslag) ======== #
 def _save_home_main_callback():
-    edited = st.session_state.get("home_main_editor")
-    if edited is None or edited.empty: 
+    expected = ["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
+                "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]
+    edited = ensure_df(st.session_state.get("home_main_editor"), expected)
+    if edited.empty: 
         return
     up = edited[["EAN","Leverancier"]].copy()
     up["EAN"]=up["EAN"].astype(str).str.strip()
@@ -431,8 +467,9 @@ def _save_home_main_callback():
     st.toast("Leveranciers opgeslagen ✅", icon="✅")
 
 def _save_prices_callback():
-    edited = st.session_state.get("prices_editor_table")
-    if edited is None: 
+    expected = ["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
+    edited = ensure_df(st.session_state.get("prices_editor_table"), expected)
+    if edited.empty:
         return
     save_prices(edited)
     st.session_state["_prices_hash"] = df_hash(edited)
@@ -523,7 +560,6 @@ if choice == "Home":
         "Aanbevolen bestelaantal": st.column_config.NumberColumn("Aanbevolen bestelaantal", disabled=True),
     }
 
-    # DIRECTE OPSLAAN via on_change
     st.data_editor(
         table_for_edit, key="home_main_editor",
         use_container_width=True, num_rows="fixed",
@@ -547,7 +583,6 @@ elif choice == "Inventory":
             "EAN": st.column_config.TextColumn("EAN", disabled=True),
         }
 
-        # DIRECTE OPSLAAN bij eerste wijziging
         st.data_editor(
             prices, key="prices_editor_table",
             num_rows="dynamic", use_container_width=True,
@@ -592,7 +627,6 @@ elif choice == "Suppliers":
 
     st.subheader("Leverancierslijst (automatisch opslaan)")
     edited_sup = st.data_editor(sup, num_rows="dynamic", use_container_width=True, key="sup_editor")
-    # autosave suppliers (eenvoudig; elke render — oké voor kleine lijsten)
     save_suppliers(edited_sup)
 
     st.markdown("Verwijderen")
