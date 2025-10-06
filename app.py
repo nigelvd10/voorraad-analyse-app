@@ -1,4 +1,4 @@
-# app.py — Overstock op absolute drempel + All products-chip + forecast afronden omhoog
+# app.py — Supplier dropdown in Inventory + All products chip + forecast ceil + overstock units
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -37,29 +37,19 @@ def to_int(x, default=0):
 
 # Kolomherkenning incl. Referentie
 PATTERNS = {
-    "ean": [
-        r"^\s*ean\s*$",
-        r"\bgtin\b",
-        r"^\s*barcode\s*$",
-        r"^\s*upc\s*$",
-    ],
+    "ean": [r"^\s*ean\s*$", r"\bgtin\b", r"^\s*barcode\s*$", r"^\s*upc\s*$"],
     "ref": [
-        r"^\s*referentie\s*$",
-        r"^ref$",
-        r"\breference\b",
-        r"^\s*sku\s*$",
-        r"artikel\s*code",
-        r"artikel\s*nr",
-        r"artikelnummer",
-        r"product\s*ref(erentie)?",
-        r"vendor\s*code",
-        r"model\s*code",
+        r"^\s*referentie\s*$", r"^ref$", r"\breference\b", r"^\s*sku\s*$",
+        r"artikel\s*code", r"artikel\s*nr", r"artikelnummer",
+        r"product\s*ref(erentie)?", r"vendor\s*code", r"model\s*code",
     ],
     "title": [r"^\s*titel\s*$", r"^\s*naam\s*$", r"product\s*naam", r"title"],
     "stock": [r"vrije\s*voorraad", r"\bvoorraad\b", r"available", r"stock"],
     "sales_total": [r"verkopen\s*\(\s*totaal\s*\)", r"verkopen.*totaal", r"totaal.*verkopen", r"sales\s*total"],
-    "forecast_min_4w": [r"verkoopprognose.*4\s*w", r"forecast.*4", r"prognose.*4\s*w",
-                        r"verkoopprognose\s*min\s*\(\s*totaal\s*4\s*w\s*\)"],
+    "forecast_min_4w": [
+        r"verkoopprognose.*4\s*w", r"forecast.*4", r"prognose.*4\s*w",
+        r"verkoopprognose\s*min\s*\(\s*totaal\s*4\s*w\s*\)"
+    ],
 }
 REQ_ORDER = ["EAN","Referentie","Titel","Vrije voorraad","Verkopen (Totaal)","Verkoopprognose min (Totaal 4w)"]
 
@@ -164,6 +154,7 @@ def load_prices():
         df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0)
     df["EAN"]=df["EAN"].astype(str).str.strip()
     df["Referentie"]=df.get("Referentie","").astype(str).str.strip()
+    df["Leverancier"]=df.get("Leverancier","").astype(str)
     return df
 
 def save_prices(df):
@@ -175,6 +166,7 @@ def save_prices(df):
     df=df[need].copy()
     df["EAN"]=df["EAN"].astype(str).str.strip()
     df["Referentie"]=df["Referentie"].astype(str).str.strip()
+    df["Leverancier"]=df["Leverancier"].astype(str).str.strip()
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         df[c]=pd.to_numeric(df[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
     c=db(); cur=c.cursor()
@@ -205,6 +197,7 @@ def load_suppliers():
         df=pd.DataFrame(columns=["Naam","Locatie","Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"])
     for col in ["Productietijd (dagen)","Levertijd zee (dagen)","Levertijd lucht (dagen)"]:
         df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    df["Naam"]=df.get("Naam","").astype(str)
     return df
 
 def save_suppliers(df):
@@ -349,7 +342,6 @@ def merged_inventory():
 # Benchmarks + recommend
 # =============================
 def classify(row, over_units: int):
-    """Label op basis van absolute drempel (stuks)."""
     f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
     stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
     if stock_total <= 0:
@@ -426,7 +418,7 @@ if choice == "Home":
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # Klikbare chips voor details — nu met "All products"
+    # Klikbare chips voor details — met "All products"
     st.markdown("**Klik op een categorie voor details**")
     chip_order = ["All products"] + order
     chip_counts = {
@@ -481,14 +473,43 @@ elif choice == "Inventory":
     inv = merged_inventory()
     if inv is not None:
         st.subheader("Prijzen & parameters (blijvend opslaan)")
+
+        # --- Supplier dropdown opties ---
+        sup_df = load_suppliers()
+        sup_names = sorted(set(sup_df["Naam"].dropna().astype(str).tolist()))
         prices = load_prices()
-        prices = st.data_editor(prices, key="prices_editor_table", num_rows="dynamic", use_container_width=True)
-        col1,col2 = st.columns([1,1])
-        with col1:
+
+        # neem ook bestaande leverancierswaarden mee als ze (nog) niet in sup_names staan
+        existing = sorted(set(prices.get("Leverancier","").dropna().astype(str).tolist()))
+        options = [""] + sorted(set(sup_names + existing))
+
+        col_cfg = {
+            "Leverancier": st.column_config.SelectboxColumn(
+                "Leverancier",
+                options=options,
+                help="Kies een leverancier uit je Suppliers-lijst (of laat leeg).",
+                required=False,
+            ),
+            "EAN": st.column_config.TextColumn("EAN", disabled=True),
+        }
+
+        prices = st.data_editor(
+            prices,
+            key="prices_editor_table",
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config=col_cfg
+        )
+
+        c1, c2, c3 = st.columns([1,1,1])
+        with c1:
             if st.button("💾 Opslaan prijzen", type="primary"):
                 save_prices(prices); st.success("Prijzen opgeslagen.")
-        with col2:
+        with c2:
             if st.button("🔄 Herladen prijzen"):
+                st.cache_data.clear(); st.experimental_rerun()
+        with c3:
+            if st.button("🔁 Herladen leveranciers"):
                 st.cache_data.clear(); st.experimental_rerun()
 
         st.markdown("---")
