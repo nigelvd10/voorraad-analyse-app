@@ -1,4 +1,4 @@
-# app.py — Alles wordt automatisch opgeslagen, niks kwijt bij refresh
+# app.py — autosave op eerste wijziging (Inventory + Home)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -72,7 +72,7 @@ def build_base(df_raw, sel):
     ref_col = sel.get("ref")
     ref_series = df_raw[ref_col].astype(str) if ref_col else ""
     forecast_raw = to_num(df_raw[sel["forecast_min_4w"]])
-    forecast_ceiled = np.ceil(forecast_raw).astype(int)  # prognose altijd heel getal omhoog
+    forecast_ceiled = np.ceil(forecast_raw).astype(int)  # prognose altijd naar boven afronden
     df = pd.DataFrame({
         "EAN": df_raw[sel["ean"]].astype(str).str.strip(),
         "Referentie": ref_series,
@@ -143,8 +143,7 @@ def init_db():
 def get_setting(key, default=None):
     c=db(); cur=c.cursor()
     cur.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    c.close()
+    row = cur.fetchone(); c.close()
     return row[0] if row else default
 
 def set_setting(key, value):
@@ -293,7 +292,6 @@ def save_base_df(df):
 
 # ============ Basisdata upload UI ============ #
 if "base_df" not in st.session_state:
-    # laad laatste basisdata uit DB bij start
     st.session_state.base_df = load_base_df()
 
 def upload_base_ui():
@@ -326,8 +324,8 @@ def upload_base_ui():
                 if sel["ref"] == "— (geen) —":
                     sel["ref"] = None
                 base = build_base(raw, sel)
-                save_base_df(base)                 # <-- direct opslaan
-                st.session_state.base_df = base    # en in sessie voor direct gebruik
+                save_base_df(base)
+                st.session_state.base_df = base
                 st.success("Basisdata opgeslagen en herbruikbaar bij refresh.")
         except Exception as e:
             st.error(f"Kon Excel niet lezen: {e}")
@@ -343,7 +341,6 @@ def merged_inventory():
 
     base["EAN"] = base["EAN"].astype(str).str.strip()
 
-    # incoming som vanaf vandaag
     if not incoming.empty:
         try: incoming["ETA"] = pd.to_datetime(incoming["ETA"]).dt.date
         except Exception: pass
@@ -353,7 +350,6 @@ def merged_inventory():
         inc_sum = pd.Series(dtype=float)
     base["Incoming"] = base["EAN"].map(inc_sum).fillna(0)
 
-    # merge prijzen (incl. Referentie)
     cols = ["Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
     if not prices.empty:
         base = base.merge(prices[["EAN"]+cols], on="EAN", how="left", suffixes=("_u","_p"))
@@ -411,6 +407,37 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
+# ======== CALLBACKS (directe opslag op eerste wijziging) ======== #
+def _save_home_main_callback():
+    edited = st.session_state.get("home_main_editor")
+    if edited is None or edited.empty: 
+        return
+    up = edited[["EAN","Leverancier"]].copy()
+    up["EAN"]=up["EAN"].astype(str).str.strip()
+    up["Leverancier"]=up["Leverancier"].astype(str).str.strip()
+    prices = load_prices().copy().set_index("EAN")
+    for _, r in up.iterrows():
+        e = r["EAN"]
+        if not e: continue
+        if e not in prices.index:
+            prices.loc[e] = {
+                "Referentie":"", "Verkoopprijs":0, "Inkoopprijs":0, "Verzendkosten":0,
+                "Overige kosten":0, "Leverancier":r["Leverancier"], "MOQ":1, "Levertijd (dagen)":0
+            }
+        else:
+            prices.at[e,"Leverancier"] = r["Leverancier"]
+    save_prices(prices.reset_index())
+    st.session_state["_home_hash"] = df_hash(edited, ["EAN","Leverancier"])
+    st.toast("Leveranciers opgeslagen ✅", icon="✅")
+
+def _save_prices_callback():
+    edited = st.session_state.get("prices_editor_table")
+    if edited is None: 
+        return
+    save_prices(edited)
+    st.session_state["_prices_hash"] = df_hash(edited)
+    st.toast("Prijzen opgeslagen ✅", icon="✅")
+
 # ============ Pages ============ #
 if choice == "Home":
     st.header("Home")
@@ -420,7 +447,6 @@ if choice == "Home":
     inv = merged_inventory()
     if inv is None: st.stop()
 
-    # Overstock-drempel (stuks) bewaren/herstellen
     over_default = int(get_setting("over_units", 30))
     over_units = st.number_input("Overstock-drempel (stuks)", min_value=0, value=over_default, step=1)
     if over_units != over_default:
@@ -434,7 +460,6 @@ if choice == "Home":
     c3.metric("Out of stock", int((inv["Status"]=="Out of stock").sum()))
     c4.metric("At risk", int((inv["Status"]=="At risk").sum()))
 
-    # chart
     st.markdown("**Voorraad gezondheid**")
     order = ["Out of stock","At risk","Healthy","Overstock"]
     counts = inv["Status"].value_counts().reindex(order).fillna(0)
@@ -450,7 +475,6 @@ if choice == "Home":
              ).properties(height=280))
     st.altair_chart(chart, use_container_width=True)
 
-    # chips
     st.markdown("**Klik op een categorie voor details**")
     chip_order = ["All products"] + order
     chip_counts = {
@@ -484,7 +508,6 @@ if choice == "Home":
         df_sel["Aanbevolen bestelaantal"] = df_sel.apply(recommend, axis=1)
     table_for_edit = df_sel[show_cols].copy()
 
-    # Leverancier direct te kiezen (overige kolommen readonly)
     col_cfg = {
         "Leverancier": st.column_config.SelectboxColumn(
             "Leverancier", options=supplier_options_list(),
@@ -500,33 +523,12 @@ if choice == "Home":
         "Aanbevolen bestelaantal": st.column_config.NumberColumn("Aanbevolen bestelaantal", disabled=True),
     }
 
-    edited_main = st.data_editor(
+    # DIRECTE OPSLAAN via on_change
+    st.data_editor(
         table_for_edit, key="home_main_editor",
-        use_container_width=True, num_rows="fixed", column_config=col_cfg
+        use_container_width=True, num_rows="fixed",
+        column_config=col_cfg, on_change=_save_home_main_callback
     )
-
-    # === AUTO-OPSLAAN VAN HOOFDTABEL (Leverancier) ===
-    cur_hash = df_hash(edited_main, cols=["EAN","Leverancier"])
-    if st.session_state.get("_home_hash") != cur_hash:
-        # schrijf wijzigingen naar prices (EAN + Leverancier)
-        up = edited_main[["EAN","Leverancier"]].copy()
-        up["EAN"]=up["EAN"].astype(str).str.strip()
-        up["Leverancier"]=up["Leverancier"].astype(str).str.strip()
-
-        prices = load_prices().copy().set_index("EAN")
-        for _, r in up.iterrows():
-            e = r["EAN"]
-            if not e: continue
-            if e not in prices.index:
-                prices.loc[e] = {
-                    "Referentie":"", "Verkoopprijs":0, "Inkoopprijs":0, "Verzendkosten":0,
-                    "Overige kosten":0, "Leverancier":r["Leverancier"], "MOQ":1, "Levertijd (dagen)":0
-                }
-            else:
-                prices.at[e,"Leverancier"] = r["Leverancier"]
-        save_prices(prices.reset_index())
-        st.session_state["_home_hash"] = cur_hash
-        st.caption("✅ Wijzigingen automatisch opgeslagen.")
 
 elif choice == "Inventory":
     st.header("Inventory")
@@ -544,17 +546,13 @@ elif choice == "Inventory":
             ),
             "EAN": st.column_config.TextColumn("EAN", disabled=True),
         }
-        edited_prices = st.data_editor(
-            prices, key="prices_editor_table",
-            num_rows="dynamic", use_container_width=True, column_config=col_cfg
-        )
 
-        # auto-save prijzen bij wijziging
-        cur_hash = df_hash(edited_prices)
-        if st.session_state.get("_prices_hash") != cur_hash:
-            save_prices(edited_prices)
-            st.session_state["_prices_hash"] = cur_hash
-            st.caption("✅ Prijzen automatisch opgeslagen.")
+        # DIRECTE OPSLAAN bij eerste wijziging
+        st.data_editor(
+            prices, key="prices_editor_table",
+            num_rows="dynamic", use_container_width=True,
+            column_config=col_cfg, on_change=_save_prices_callback
+        )
 
         st.markdown("---")
         st.subheader("Overzicht producten")
@@ -594,11 +592,8 @@ elif choice == "Suppliers":
 
     st.subheader("Leverancierslijst (automatisch opslaan)")
     edited_sup = st.data_editor(sup, num_rows="dynamic", use_container_width=True, key="sup_editor")
-    cur_hash = df_hash(edited_sup)
-    if st.session_state.get("_sup_hash") != cur_hash:
-        save_suppliers(edited_sup)
-        st.session_state["_sup_hash"] = cur_hash
-        st.caption("✅ Leveranciers automatisch opgeslagen.")
+    # autosave suppliers (eenvoudig; elke render — oké voor kleine lijsten)
+    save_suppliers(edited_sup)
 
     st.markdown("Verwijderen")
     del_name = st.selectbox("🗑️ Kies leverancier", ["—"] + edited_sup["Naam"].astype(str).tolist())
@@ -633,7 +628,6 @@ elif choice == "Incoming":
         try: inc_disp["ETA"] = pd.to_datetime(inc_disp["ETA"]).dt.date
         except Exception: pass
         st.dataframe(inc_disp, use_container_width=True)
-
         st.markdown("Rij verwijderen")
         del_id = st.number_input("ID (zie kolom 'id')", min_value=0, step=1, value=0)
         if st.button("🗑️ Verwijder ID"):
