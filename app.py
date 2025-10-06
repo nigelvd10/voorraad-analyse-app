@@ -1,4 +1,4 @@
-# app.py — Supplier dropdown in Inventory + Home quick-edit + All products chip + forecast ceil + overstock units
+# app.py — Leverancier-dropdown direct in hoofdtafel (Home) + alles wat eerder werkte
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -74,7 +74,6 @@ def read_excel_all(file):
 def build_base(df_raw, sel):
     ref_col = sel.get("ref")
     ref_series = df_raw[ref_col].astype(str) if ref_col else ""
-
     # Prognose naar boven afronden
     forecast_raw = to_num(df_raw[sel["forecast_min_4w"]])
     forecast_ceiled = np.ceil(forecast_raw).astype(int)
@@ -90,7 +89,7 @@ def build_base(df_raw, sel):
     return df[REQ_ORDER]
 
 # =============================
-# SQLite opslag (blijvend)
+# SQLite (blijvend)
 # =============================
 DB_PATH = os.path.join(os.getcwd(), "app_data.db")
 def db(): return sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -363,9 +362,7 @@ def recommend(row):
     moq = to_int(row.get("MOQ",1),1)
     return int(np.ceil(need/max(1,moq))*max(1,moq))
 
-# -----------------------------
-# Supplier options & apply helper
-# -----------------------------
+# Helpers: suppliers lijst + opslaan
 def supplier_options_list():
     sup_df = load_suppliers()
     sup_names = sorted(set(sup_df["Naam"].dropna().astype(str).tolist()))
@@ -374,24 +371,17 @@ def supplier_options_list():
     return [""] + sorted(set(sup_names + existing))
 
 def apply_supplier_updates(update_df: pd.DataFrame):
-    """Neemt EAN + Leverancier uit een editor en schrijft dit naar de prices-DB."""
     if update_df is None or update_df.empty:
         return
     updates = update_df[["EAN","Leverancier"]].copy()
     updates["EAN"] = updates["EAN"].astype(str).str.strip()
     updates["Leverancier"] = updates["Leverancier"].astype(str).str.strip()
 
-    prices = load_prices()
-    prices = prices.copy()
-
-    # merge/overwrite leverancier per EAN
-    prices = prices.set_index("EAN")
+    prices = load_prices().copy().set_index("EAN")
     for _, r in updates.iterrows():
         e = r["EAN"]
-        if not e:
-            continue
+        if not e: continue
         if e not in prices.index:
-            # nieuw stub record
             prices.loc[e] = {
                 "Referentie":"", "Verkoopprijs":0, "Inkoopprijs":0, "Verzendkosten":0,
                 "Overige kosten":0, "Leverancier":r["Leverancier"], "MOQ":1, "Levertijd (dagen)":0
@@ -399,11 +389,10 @@ def apply_supplier_updates(update_df: pd.DataFrame):
         else:
             prices.at[e, "Leverancier"] = r["Leverancier"]
     prices = prices.reset_index()
-
     save_prices(prices)
 
 # =============================
-# Sidebar navigatie (emoji)
+# Sidebar
 # =============================
 with st.sidebar:
     st.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
@@ -427,9 +416,7 @@ if choice == "Home":
     inv = merged_inventory()
     if inv is None: st.stop()
 
-    # Absolute drempel in stuks
     over_units = st.number_input("Overstock-drempel (stuks)", min_value=0, value=30, step=1)
-
     inv["Status"] = inv.apply(lambda r: classify(r, over_units), axis=1)
 
     c1,c2,c3,c4 = st.columns(4)
@@ -438,26 +425,21 @@ if choice == "Home":
     c3.metric("Out of stock", int((inv["Status"]=="Out of stock").sum()))
     c4.metric("At risk", int((inv["Status"]=="At risk").sum()))
 
-    # Staafdiagram met vaste kleuren
     st.markdown("**Voorraad gezondheid**")
     order = ["Out of stock","At risk","Healthy","Overstock"]
     counts = inv["Status"].value_counts().reindex(order).fillna(0)
     chart_df = pd.DataFrame({"Status":order,"Aantal":[int(counts.get(s,0)) for s in order]})
     y_max = max(1, int(chart_df["Aantal"].max()))
     color_scale = alt.Scale(domain=order, range=["#E74C3C", "#F39C12", "#27AE60", "#34495E"])
-    chart = (
-        alt.Chart(chart_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("Status:N", sort=order, title="Status"),
-            y=alt.Y("Aantal:Q", scale=alt.Scale(domain=(0, y_max)), title="Aantal"),
-            color=alt.Color("Status:N", scale=color_scale, legend=None),
-        )
-        .properties(height=280)
-    )
+    chart = (alt.Chart(chart_df)
+             .mark_bar()
+             .encode(
+                 x=alt.X("Status:N", sort=order, title="Status"),
+                 y=alt.Y("Aantal:Q", scale=alt.Scale(domain=(0, y_max)), title="Aantal"),
+                 color=alt.Color("Status:N", scale=color_scale, legend=None),
+             ).properties(height=280))
     st.altair_chart(chart, use_container_width=True)
 
-    # Klikbare chips — met "All products"
     st.markdown("**Klik op een categorie voor details**")
     chip_order = ["All products"] + order
     chip_counts = {
@@ -477,32 +459,24 @@ if choice == "Home":
                 st.session_state["selected_status"] = s
 
     st.markdown("---")
-    # Overzicht
-    if selected:
-        if selected == "All products":
-            st.subheader("Details: All products")
-            df_sel = inv.copy()
-        else:
-            st.subheader(f"Details: {selected}")
-            df_sel = inv[inv["Status"]==selected].copy()
+    # Welke set tonen?
+    if selected and selected != "All products":
+        st.subheader(f"Details: {selected}")
+        df_sel = inv[inv["Status"]==selected].copy()
     else:
         st.subheader("Toplijst (aanbevolen bestelaantal)")
         inv["Aanbevolen bestelaantal"] = inv.apply(recommend, axis=1)
         df_sel = inv.copy()
 
-    # Leesbare tabel
+    # ======= HOOFD-TABEL MET DROPDOWN =======
     show_cols = ["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
                  "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]
     if "Aanbevolen bestelaantal" not in df_sel.columns:
         df_sel["Aanbevolen bestelaantal"] = df_sel.apply(recommend, axis=1)
-    st.dataframe(df_sel[show_cols], use_container_width=True)
-
-    # --- NIEUW: snelle leverancier-edit direct op Home ---
-    st.markdown("###### Leverancier snel bewerken (optioneel)")
-    edit_cols = ["EAN","Referentie","Titel","Leverancier"]
-    quick = df_sel[edit_cols].copy()
+    table_for_edit = df_sel[show_cols].copy()
 
     col_cfg = {
+        # alleen Leverancier editable; de rest readonly
         "Leverancier": st.column_config.SelectboxColumn(
             "Leverancier",
             options=supplier_options_list(),
@@ -510,20 +484,25 @@ if choice == "Home":
             required=False,
         ),
         "EAN": st.column_config.TextColumn("EAN", disabled=True),
+        "Status": st.column_config.TextColumn("Status", disabled=True),
         "Referentie": st.column_config.TextColumn("Referentie", disabled=True),
         "Titel": st.column_config.TextColumn("Titel", disabled=True),
+        "Vrije voorraad": st.column_config.NumberColumn("Vrije voorraad", disabled=True),
+        "Incoming": st.column_config.NumberColumn("Incoming", disabled=True),
+        "Verkoopprognose min (Totaal 4w)": st.column_config.NumberColumn("Verkoopprognose min (Totaal 4w)", disabled=True),
+        "Aanbevolen bestelaantal": st.column_config.NumberColumn("Aanbevolen bestelaantal", disabled=True),
     }
 
-    edited = st.data_editor(
-        quick,
-        key="home_supplier_editor",
+    edited_main = st.data_editor(
+        table_for_edit,
+        key="home_main_editor",
         use_container_width=True,
         num_rows="fixed",
         column_config=col_cfg
     )
 
-    if st.button("💾 Opslaan leveranciers (Home)"):
-        apply_supplier_updates(edited)
+    if st.button("💾 Opslaan leveranciers (tabel hierboven)"):
+        apply_supplier_updates(edited_main)
         st.success("Leveranciers opgeslagen. Overzicht herladen…")
         st.cache_data.clear()
         st.experimental_rerun()
@@ -536,27 +515,19 @@ elif choice == "Inventory":
     inv = merged_inventory()
     if inv is not None:
         st.subheader("Prijzen & parameters (blijvend opslaan)")
-
-        # Dropdown-opties voor leveranciers
         options = supplier_options_list()
         prices = load_prices()
 
         col_cfg = {
             "Leverancier": st.column_config.SelectboxColumn(
-                "Leverancier",
-                options=options,
-                help="Kies een leverancier uit je Suppliers-lijst (of laat leeg).",
-                required=False,
+                "Leverancier", options=options, help="Kies uit Suppliers.", required=False
             ),
             "EAN": st.column_config.TextColumn("EAN", disabled=True),
         }
 
         prices = st.data_editor(
-            prices,
-            key="prices_editor_table",
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config=col_cfg
+            prices, key="prices_editor_table",
+            num_rows="dynamic", use_container_width=True, column_config=col_cfg
         )
 
         c1, c2, c3 = st.columns([1,1,1])
