@@ -1,4 +1,4 @@
-# app.py — Leverancier-dropdown direct in hoofdtafel (Home) + alles wat eerder werkte
+# app.py — Hoofdtabel heeft knop "Alle wijzigingen opslaan" (schrijft alle bewerkbare edits weg)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,9 +6,6 @@ import altair as alt
 import sqlite3, os, re
 from datetime import date
 
-# =============================
-# App setup & styling
-# =============================
 st.set_page_config(page_title="Voorraad App", layout="wide")
 
 SIDEBAR_CSS = """
@@ -22,9 +19,6 @@ section[data-testid="stSidebar"] {background:#201915;color:#fff;}
 """
 st.markdown(SIDEBAR_CSS, unsafe_allow_html=True)
 
-# =============================
-# Helpers
-# =============================
 def to_num(x):
     return pd.to_numeric(pd.Series(x).astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
@@ -35,7 +29,6 @@ def to_int(x, default=0):
     except Exception:
         return default
 
-# Kolomherkenning incl. Referentie
 PATTERNS = {
     "ean": [r"^\s*ean\s*$", r"\bgtin\b", r"^\s*barcode\s*$", r"^\s*upc\s*$"],
     "ref": [
@@ -74,10 +67,8 @@ def read_excel_all(file):
 def build_base(df_raw, sel):
     ref_col = sel.get("ref")
     ref_series = df_raw[ref_col].astype(str) if ref_col else ""
-    # Prognose naar boven afronden
     forecast_raw = to_num(df_raw[sel["forecast_min_4w"]])
     forecast_ceiled = np.ceil(forecast_raw).astype(int)
-
     df = pd.DataFrame({
         "EAN": df_raw[sel["ean"]].astype(str).str.strip(),
         "Referentie": ref_series,
@@ -88,9 +79,6 @@ def build_base(df_raw, sel):
     })
     return df[REQ_ORDER]
 
-# =============================
-# SQLite (blijvend)
-# =============================
 DB_PATH = os.path.join(os.getcwd(), "app_data.db")
 def db(): return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -249,9 +237,6 @@ def delete_incoming_row(row_id: int):
     c.commit(); c.close()
     st.cache_data.clear()
 
-# =============================
-# Basisdata upload
-# =============================
 if "base_df" not in st.session_state:
     st.session_state.base_df = None
 
@@ -264,15 +249,12 @@ def upload_base_ui():
             sheet = st.selectbox("Kies sheet", list(sheets.keys()))
             raw = sheets[sheet]
             st.dataframe(raw.head(8), use_container_width=True)
-
             auto = auto_map(raw)
-
             def pick(lbl, key, optional=False):
                 opts = (["— (geen) —"] if optional else []) + list(raw.columns)
                 default = auto.get(key)
                 idx = (opts.index(default) if default in opts else 0)
                 return st.selectbox(lbl, opts, index=idx)
-
             sel = {
                 "ean": pick("Kolom voor EAN *","ean"),
                 "ref": pick("Kolom voor Referentie (aanbevolen)","ref", optional=True),
@@ -290,18 +272,13 @@ def upload_base_ui():
         except Exception as e:
             st.error(f"Kon Excel niet lezen: {e}")
 
-# =============================
-# Merge helper
-# =============================
 def merged_inventory():
     base = st.session_state.base_df
     if base is None: return None
     base = base.copy()
     prices = load_prices().copy()
     incoming = load_incoming().copy()
-
     base["EAN"] = base["EAN"].astype(str).str.strip()
-
     if not incoming.empty:
         try: incoming["ETA"] = pd.to_datetime(incoming["ETA"]).dt.date
         except Exception: pass
@@ -310,47 +287,30 @@ def merged_inventory():
     else:
         inc_sum = pd.Series(dtype=float)
     base["Incoming"] = base["EAN"].map(inc_sum).fillna(0)
-
     cols = ["Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
     if not prices.empty:
-        base = base.merge(
-            prices[["EAN"] + cols],
-            on="EAN",
-            how="left",
-            suffixes=("_u", "_p")
-        )
+        base = base.merge(prices[["EAN"] + cols], on="EAN", how="left", suffixes=("_u", "_p"))
         if "Referentie_u" in base.columns or "Referentie_p" in base.columns:
             base["Referentie"] = base.get("Referentie_u","").replace("", np.nan).fillna(base.get("Referentie_p",""))
-            base.drop(columns=[c for c in ["Referentie_u","Referentie_p"] if c in base.columns],
-                     inplace=True, errors="ignore")
+            base.drop(columns=[c for c in ["Referentie_u","Referentie_p"] if c in base.columns], inplace=True, errors="ignore")
     else:
         for c in cols:
             if c not in base.columns: base[c] = 0 if c not in ["Leverancier","Referentie"] else ""
-
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         base[c] = pd.to_numeric(base[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
-
     if "Leverancier" not in base.columns: base["Leverancier"]=""
     if "Referentie" not in base.columns: base["Referentie"]=""
-
     base["Voorraadwaarde (verkoop)"] = base["Vrije voorraad"] * base["Verkoopprijs"].fillna(0)
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
     return base
 
-# =============================
-# Benchmarks + recommend
-# =============================
 def classify(row, over_units: int):
     f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
     stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
-    if stock_total <= 0:
-        return "Out of stock"
-    if f <= 0:
-        return "Healthy"
-    if stock_total < f:
-        return "At risk"
-    if stock_total >= f + over_units:
-        return "Overstock"
+    if stock_total <= 0: return "Out of stock"
+    if f <= 0: return "Healthy"
+    if stock_total < f: return "At risk"
+    if stock_total >= f + over_units: return "Overstock"
     return "Healthy"
 
 def recommend(row):
@@ -362,7 +322,6 @@ def recommend(row):
     moq = to_int(row.get("MOQ",1),1)
     return int(np.ceil(need/max(1,moq))*max(1,moq))
 
-# Helpers: suppliers lijst + opslaan
 def supplier_options_list():
     sup_df = load_suppliers()
     sup_names = sorted(set(sup_df["Naam"].dropna().astype(str).tolist()))
@@ -370,15 +329,17 @@ def supplier_options_list():
     existing = sorted(set(prices.get("Leverancier","").dropna().astype(str).tolist()))
     return [""] + sorted(set(sup_names + existing))
 
-def apply_supplier_updates(update_df: pd.DataFrame):
+def apply_main_table_updates(update_df: pd.DataFrame):
+    """Schrijft alle bewerkbare kolommen uit de hoofdtabel weg (nu: Leverancier)."""
     if update_df is None or update_df.empty:
         return
-    updates = update_df[["EAN","Leverancier"]].copy()
-    updates["EAN"] = updates["EAN"].astype(str).str.strip()
-    updates["Leverancier"] = updates["Leverancier"].astype(str).str.strip()
+    # Pak alleen kolommen die in prices-DB thuishoren en bewerkbaar zijn
+    up = update_df[["EAN","Leverancier"]].copy()
+    up["EAN"] = up["EAN"].astype(str).str.strip()
+    up["Leverancier"] = up["Leverancier"].astype(str).str.strip()
 
     prices = load_prices().copy().set_index("EAN")
-    for _, r in updates.iterrows():
+    for _, r in up.iterrows():
         e = r["EAN"]
         if not e: continue
         if e not in prices.index:
@@ -388,12 +349,8 @@ def apply_supplier_updates(update_df: pd.DataFrame):
             }
         else:
             prices.at[e, "Leverancier"] = r["Leverancier"]
-    prices = prices.reset_index()
-    save_prices(prices)
+    save_prices(prices.reset_index())
 
-# =============================
-# Sidebar
-# =============================
 with st.sidebar:
     st.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
     pages = ["Home", "Inventory", "Suppliers", "Incoming"]
@@ -405,9 +362,6 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
-# =============================
-# Pages
-# =============================
 if choice == "Home":
     st.header("Home")
     if st.session_state.base_df is None:
@@ -459,7 +413,6 @@ if choice == "Home":
                 st.session_state["selected_status"] = s
 
     st.markdown("---")
-    # Welke set tonen?
     if selected and selected != "All products":
         st.subheader(f"Details: {selected}")
         df_sel = inv[inv["Status"]==selected].copy()
@@ -468,7 +421,6 @@ if choice == "Home":
         inv["Aanbevolen bestelaantal"] = inv.apply(recommend, axis=1)
         df_sel = inv.copy()
 
-    # ======= HOOFD-TABEL MET DROPDOWN =======
     show_cols = ["Status","EAN","Referentie","Titel","Vrije voorraad","Incoming",
                  "Verkoopprognose min (Totaal 4w)","Aanbevolen bestelaantal","Leverancier"]
     if "Aanbevolen bestelaantal" not in df_sel.columns:
@@ -476,12 +428,9 @@ if choice == "Home":
     table_for_edit = df_sel[show_cols].copy()
 
     col_cfg = {
-        # alleen Leverancier editable; de rest readonly
         "Leverancier": st.column_config.SelectboxColumn(
-            "Leverancier",
-            options=supplier_options_list(),
-            help="Kies leverancier uit je Suppliers-lijst (of laat leeg).",
-            required=False,
+            "Leverancier", options=supplier_options_list(),
+            help="Kies leverancier uit je Suppliers-lijst (of laat leeg).", required=False
         ),
         "EAN": st.column_config.TextColumn("EAN", disabled=True),
         "Status": st.column_config.TextColumn("Status", disabled=True),
@@ -494,16 +443,14 @@ if choice == "Home":
     }
 
     edited_main = st.data_editor(
-        table_for_edit,
-        key="home_main_editor",
-        use_container_width=True,
-        num_rows="fixed",
-        column_config=col_cfg
+        table_for_edit, key="home_main_editor",
+        use_container_width=True, num_rows="fixed", column_config=col_cfg
     )
 
-    if st.button("💾 Opslaan leveranciers (tabel hierboven)"):
-        apply_supplier_updates(edited_main)
-        st.success("Leveranciers opgeslagen. Overzicht herladen…")
+    # === Nieuw: knopnaam + gedrag ===
+    if st.button("💾 Alle wijzigingen opslaan", type="primary"):
+        apply_main_table_updates(edited_main)
+        st.success("Wijzigingen opgeslagen. Overzicht herladen…")
         st.cache_data.clear()
         st.experimental_rerun()
 
@@ -517,19 +464,16 @@ elif choice == "Inventory":
         st.subheader("Prijzen & parameters (blijvend opslaan)")
         options = supplier_options_list()
         prices = load_prices()
-
         col_cfg = {
             "Leverancier": st.column_config.SelectboxColumn(
                 "Leverancier", options=options, help="Kies uit Suppliers.", required=False
             ),
             "EAN": st.column_config.TextColumn("EAN", disabled=True),
         }
-
         prices = st.data_editor(
             prices, key="prices_editor_table",
             num_rows="dynamic", use_container_width=True, column_config=col_cfg
         )
-
         c1, c2, c3 = st.columns([1,1,1])
         with c1:
             if st.button("💾 Opslaan prijzen", type="primary"):
@@ -552,7 +496,6 @@ elif choice == "Inventory":
 elif choice == "Suppliers":
     st.header("Suppliers")
     sup = load_suppliers()
-
     with st.form("new_supplier"):
         st.subheader("Nieuwe leverancier toevoegen")
         naam = st.text_input("Naam *")
@@ -605,7 +548,6 @@ elif choice == "Incoming":
             else:
                 add_incoming_row(ean, ref, qty, eta.isoformat() if eta else "", leverancier, note)
                 st.success("Zending toegevoegd.")
-
     st.subheader("Overzicht inkomende zendingen")
     inc = load_incoming()
     if inc.empty:
@@ -615,7 +557,6 @@ elif choice == "Incoming":
         try: inc_disp["ETA"] = pd.to_datetime(inc_disp["ETA"]).dt.date
         except Exception: pass
         st.dataframe(inc_disp, use_container_width=True)
-
         st.markdown("Rij verwijderen")
         del_id = st.number_input("ID (zie kolom 'id')", min_value=0, step=1, value=0)
         if st.button("🗑️ Verwijder ID"):
