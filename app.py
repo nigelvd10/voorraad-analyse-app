@@ -1,4 +1,4 @@
-# app.py — autosave per cel voor alle kolommen (zonder on_change)
+# app.py — autosave per cel met 'dirty flag' (1x invullen)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -179,7 +179,8 @@ def load_prices():
     for col in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0)
     df["EAN"]=df["EAN"].astype(str).str.strip()
-    df["Referentie"]=df.get("Referentie","").astype(str).str.strip()
+    df["Referentie"]=df.get("Referentie","").astype(str).stripped = df["Referentie"].astype(str).str.strip()
+    df["Referentie"]=df["Referentie"].astype(str)
     df["Leverancier"]=df.get("Leverancier","").astype(str)
     return df
 
@@ -430,6 +431,13 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
+# ======== Dirty-flag callbacks ======== #
+def _mark_prices_dirty():
+    st.session_state["_prices_dirty"] = True
+
+def _mark_home_dirty():
+    st.session_state["_home_dirty"] = True
+
 # ============ Pages ============ #
 if choice == "Home":
     st.header("Home")
@@ -517,16 +525,17 @@ if choice == "Home":
     ret_home = st.data_editor(
         table_for_edit, key="home_main_editor",
         use_container_width=True, num_rows="fixed",
-        column_config=col_cfg
+        column_config=col_cfg, on_change=_mark_home_dirty
     )
 
-    # --- AUTOSAVE leverancier (betrouwbaar, na render) ---
+    # AUTOSAVE (zekerheidsnet + dirty-flag)
     subset = ret_home[["EAN","Leverancier"]].copy()
     subset["EAN"]=subset["EAN"].astype(str).str.strip()
     h = df_hash(subset, ["EAN","Leverancier"])
-    if h != st.session_state.get("_home_hash"):
+    if st.session_state.get("_home_dirty") or h != st.session_state.get("_home_hash"):
         upsert_prices_partial(subset)
         st.session_state["_home_hash"] = h
+        st.session_state["_home_dirty"] = False
         st.toast("Leveranciers opgeslagen ✅", icon="✅")
 
 elif choice == "Inventory":
@@ -548,14 +557,15 @@ elif choice == "Inventory":
         ret_prices = st.data_editor(
             prices, key="prices_editor_table",
             num_rows="dynamic", use_container_width=True,
-            column_config=col_cfg
+            column_config=col_cfg, on_change=_mark_prices_dirty
         )
 
-        # --- AUTOSAVE ALLE KOLOMMEN (na render) ---
+        # AUTOSAVE (dirty-flag + hash)
         h = df_hash(ret_prices, PRICE_COLS)
-        if h != st.session_state.get("_prices_hash"):
+        if st.session_state.get("_prices_dirty") or h != st.session_state.get("_prices_hash"):
             upsert_prices_partial(ret_prices)
             st.session_state["_prices_hash"] = h
+            st.session_state["_prices_dirty"] = False
             st.toast("Wijzigingen opgeslagen ✅", icon="✅")
 
         st.markdown("---")
@@ -592,7 +602,7 @@ elif choice == "Suppliers":
                 save_suppliers(sup); st.success("Leverancier opgeslagen.")
     st.subheader("Leverancierslijst (automatisch opslaan)")
     ret_sup = st.data_editor(sup, num_rows="dynamic", use_container_width=True, key="sup_editor")
-    save_suppliers(ret_sup)  # simpele autosave
+    save_suppliers(ret_sup)
 
     st.markdown("Verwijderen")
     del_name = st.selectbox("🗑️ Kies leverancier", ["—"] + ret_sup["Naam"].astype(str).tolist())
