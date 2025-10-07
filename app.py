@@ -1,4 +1,4 @@
-# app.py — autosave per cel met 'dirty flag' (1x invullen)
+# app.py — stabiele autosave: één waarheid in session_state, geen 2x invullen meer
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -41,18 +41,11 @@ def ensure_df(obj, expected_cols=None) -> pd.DataFrame:
     if isinstance(obj, pd.DataFrame):
         df = obj.copy()
     elif isinstance(obj, dict):
-        try:
-            df = pd.DataFrame(obj)
-        except Exception:
-            try:
-                df = pd.DataFrame.from_dict(obj, orient="index")
-            except Exception:
-                df = pd.DataFrame()
+        try: df = pd.DataFrame(obj)
+        except Exception: df = pd.DataFrame()
     elif isinstance(obj, list):
-        try:
-            df = pd.DataFrame(obj)
-        except Exception:
-            df = pd.DataFrame()
+        try: df = pd.DataFrame(obj)
+        except Exception: df = pd.DataFrame()
     else:
         df = pd.DataFrame()
     if expected_cols:
@@ -62,7 +55,7 @@ def ensure_df(obj, expected_cols=None) -> pd.DataFrame:
         df = df[expected_cols]
     return df
 
-# ============ Kolom herkenning (incl. Referentie) ============ #
+# ============ Kolom-detectie (incl. Referentie) ============ #
 PATTERNS = {
     "ean": [r"^\s*ean\s*$", r"\bgtin\b", r"^\s*barcode\s*$", r"^\s*upc\s*$"],
     "ref": [r"^\s*referentie\s*$", r"^ref$", r"\breference\b", r"^\s*sku\s*$",
@@ -179,8 +172,7 @@ def load_prices():
     for col in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0)
     df["EAN"]=df["EAN"].astype(str).str.strip()
-    df["Referentie"]=df.get("Referentie","").astype(str).stripped = df["Referentie"].astype(str).str.strip()
-    df["Referentie"]=df["Referentie"].astype(str)
+    df["Referentie"]=df.get("Referentie","").astype(str).str.strip()
     df["Leverancier"]=df.get("Leverancier","").astype(str)
     return df
 
@@ -205,29 +197,6 @@ def save_prices_full(df_full: pd.DataFrame):
         for _, r in df_full.iterrows() if str(r["EAN"]).strip()!=""
     ])
     c.commit(); c.close()
-
-def upsert_prices_partial(df_partial: pd.DataFrame):
-    base = load_prices().set_index("EAN")
-    part = ensure_df(df_partial, PRICE_COLS).copy()
-    part["EAN"]=part["EAN"].astype(str).str.strip()
-    part = part[part["EAN"]!=""]
-    for ccol in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
-        part[ccol]=pd.to_numeric(part[ccol].astype(str).str.replace(",",".",regex=False), errors="coerce")
-    for _, r in part.iterrows():
-        e = r["EAN"]
-        if e not in base.index:
-            base.loc[e] = {col: 0 for col in PRICE_COLS if col not in ["EAN","Referentie","Leverancier"]}
-            base.at[e,"Referentie"]=""; base.at[e,"Leverancier"]=""
-        for col in PRICE_COLS:
-            if col=="EAN": continue
-            val = r[col]
-            if pd.isna(val):  # laat ongewijzigd als NaN
-                continue
-            if isinstance(val, str):
-                base.at[e,col]=val.strip()
-            else:
-                base.at[e,col]=float(val) if col not in ["MOQ","Levertijd (dagen)"] else int(val)
-    save_prices_full(base.reset_index())
 
 # ---- suppliers ---- #
 def load_suppliers():
@@ -358,11 +327,11 @@ def upload_base_ui():
             st.error(f"Kon Excel niet lezen: {e}")
 
 # ============ Merge helper ============ #
-def merged_inventory():
+def merged_inventory(prices_df=None):
     base = st.session_state.base_df
     if base is None: return None
     base = base.copy()
-    prices = load_prices().copy()
+    prices = prices_df if prices_df is not None else load_prices().copy()
     incoming = load_incoming().copy()
 
     base["EAN"] = base["EAN"].astype(str).str.strip()
@@ -415,8 +384,10 @@ def recommend(row):
 def supplier_options_list():
     sup_df = load_suppliers()
     sup_names = sorted(set(sup_df["Naam"].dropna().astype(str).tolist()))
-    prices = load_prices()
-    existing = sorted(set(prices.get("Leverancier","").dropna().astype(str).tolist()))
+    if "prices_df" in st.session_state and not st.session_state.prices_df.empty:
+        existing = sorted(set(st.session_state.prices_df.get("Leverancier","").dropna().astype(str).tolist()))
+    else:
+        existing = []
     return [""] + sorted(set(sup_names + existing))
 
 # ============ Sidebar ============ #
@@ -431,12 +402,11 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
-# ======== Dirty-flag callbacks ======== #
-def _mark_prices_dirty():
-    st.session_state["_prices_dirty"] = True
-
-def _mark_home_dirty():
-    st.session_state["_home_dirty"] = True
+# ===== Session-state voor prijzen (één waarheid) =====
+if "prices_df" not in st.session_state:
+    st.session_state.prices_df = load_prices()
+if "_prices_hash" not in st.session_state:
+    st.session_state._prices_hash = df_hash(st.session_state.prices_df, PRICE_COLS)
 
 # ============ Pages ============ #
 if choice == "Home":
@@ -444,7 +414,7 @@ if choice == "Home":
     if st.session_state.base_df is None:
         st.info("Nog geen basisdata geladen. Upload hieronder (wordt automatisch opgeslagen).")
         upload_base_ui()
-    inv = merged_inventory()
+    inv = merged_inventory(prices_df=st.session_state.prices_df)
     if inv is None: st.stop()
 
     over_default = int(get_setting("over_units", 30))
@@ -525,17 +495,26 @@ if choice == "Home":
     ret_home = st.data_editor(
         table_for_edit, key="home_main_editor",
         use_container_width=True, num_rows="fixed",
-        column_config=col_cfg, on_change=_mark_home_dirty
+        column_config=col_cfg
     )
 
-    # AUTOSAVE (zekerheidsnet + dirty-flag)
-    subset = ret_home[["EAN","Leverancier"]].copy()
-    subset["EAN"]=subset["EAN"].astype(str).str.strip()
-    h = df_hash(subset, ["EAN","Leverancier"])
-    if st.session_state.get("_home_dirty") or h != st.session_state.get("_home_hash"):
-        upsert_prices_partial(subset)
-        st.session_state["_home_hash"] = h
-        st.session_state["_home_dirty"] = False
+    # AUTOSAVE leverancier — direct in session_state.prices_df en DB
+    new_sup = ret_home[["EAN","Leverancier"]].copy()
+    new_sup["EAN"]=new_sup["EAN"].astype(str).str.strip()
+    merged = st.session_state.prices_df.set_index("EAN").copy()
+    for _, row in new_sup.iterrows():
+        e = row["EAN"]
+        if e == "": continue
+        if e not in merged.index:
+            merged.loc[e] = {c: 0 for c in PRICE_COLS if c not in ["EAN","Referentie","Leverancier"]}
+            merged.at[e,"Referentie"] = ""
+        merged.at[e,"Leverancier"] = str(row["Leverancier"] or "")
+    # alleen opslaan als er echt iets gewijzigd is
+    h_new = df_hash(merged.reset_index(), PRICE_COLS)
+    if h_new != st.session_state._prices_hash:
+        save_prices_full(merged.reset_index())
+        st.session_state.prices_df = merged.reset_index()
+        st.session_state._prices_hash = h_new
         st.toast("Leveranciers opgeslagen ✅", icon="✅")
 
 elif choice == "Inventory":
@@ -543,38 +522,49 @@ elif choice == "Inventory":
     if st.session_state.base_df is None:
         st.info("Upload eerst je basisbestand (wordt automatisch opgeslagen).")
         upload_base_ui()
-    inv = merged_inventory()
-    if inv is not None:
-        st.subheader("Prijzen & parameters (automatisch opslaan)")
-        options = supplier_options_list()
-        prices = load_prices()
-        col_cfg = {
-            "Leverancier": st.column_config.SelectboxColumn(
-                "Leverancier", options=options, help="Kies uit Suppliers.", required=False
-            ),
-            "EAN": st.column_config.TextColumn("EAN", disabled=True),
-        }
-        ret_prices = st.data_editor(
-            prices, key="prices_editor_table",
-            num_rows="dynamic", use_container_width=True,
-            column_config=col_cfg, on_change=_mark_prices_dirty
-        )
 
-        # AUTOSAVE (dirty-flag + hash)
-        h = df_hash(ret_prices, PRICE_COLS)
-        if st.session_state.get("_prices_dirty") or h != st.session_state.get("_prices_hash"):
-            upsert_prices_partial(ret_prices)
-            st.session_state["_prices_hash"] = h
-            st.session_state["_prices_dirty"] = False
-            st.toast("Wijzigingen opgeslagen ✅", icon="✅")
+    # ---- Editor werkt op session_state.prices_df ----
+    st.subheader("Prijzen & parameters (automatisch opslaan)")
+    options = supplier_options_list()
+    col_cfg = {
+        "EAN": st.column_config.TextColumn("EAN", disabled=True),
+        "Leverancier": st.column_config.SelectboxColumn(
+            "Leverancier", options=options, help="Kies uit Suppliers.", required=False
+        ),
+    }
 
-        st.markdown("---")
-        st.subheader("Overzicht producten")
-        show_cols = ["EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)",
-                     "Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
-        for c in show_cols:
-            if c not in inv.columns: inv[c]=""
-        st.dataframe(inv[show_cols], use_container_width=True)
+    edited = st.data_editor(
+        st.session_state.prices_df,
+        key="prices_editor_table",
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config=col_cfg
+    )
+
+    # Normaliseer types + opslaan indien veranderd
+    edited = ensure_df(edited, PRICE_COLS)
+    for ccol in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
+        edited[ccol]=pd.to_numeric(edited[ccol].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
+    edited["EAN"]=edited["EAN"].astype(str).str.strip()
+    edited["Referentie"]=edited["Referentie"].astype(str).str.strip()
+    edited["Leverancier"]=edited["Leverancier"].astype(str).str.strip()
+
+    h_new = df_hash(edited, PRICE_COLS)
+    if h_new != st.session_state._prices_hash:
+        # schrijf ALLES weg (volledig), update session_state, update hash
+        save_prices_full(edited)
+        st.session_state.prices_df = edited.copy()
+        st.session_state._prices_hash = h_new
+        st.toast("Wijzigingen opgeslagen ✅", icon="✅")
+
+    st.markdown("---")
+    st.subheader("Overzicht producten")
+    inv = merged_inventory(prices_df=st.session_state.prices_df)
+    show_cols = ["EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)",
+                 "Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
+    for c in show_cols:
+        if c not in inv.columns: inv[c]=""
+    st.dataframe(inv[show_cols], use_container_width=True)
 
 elif choice == "Suppliers":
     st.header("Suppliers")
@@ -603,12 +593,7 @@ elif choice == "Suppliers":
     st.subheader("Leverancierslijst (automatisch opslaan)")
     ret_sup = st.data_editor(sup, num_rows="dynamic", use_container_width=True, key="sup_editor")
     save_suppliers(ret_sup)
-
-    st.markdown("Verwijderen")
-    del_name = st.selectbox("🗑️ Kies leverancier", ["—"] + ret_sup["Naam"].astype(str).tolist())
-    if st.button("Verwijder geselecteerde"):
-        if del_name and del_name != "—":
-            delete_supplier(del_name); st.success(f"'{del_name}' verwijderd.")
+    # (de product-editor gebruikt de options live; na refresh zie je de nieuwe namen in de dropdown)
 
 elif choice == "Incoming":
     st.header("Incoming")
