@@ -1,4 +1,4 @@
-# app.py — robuuste autosave (zet sessie-waarde altijd om naar DataFrame)
+# app.py — autosave per cel (alle prijsvelden), robuuste merge
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -43,17 +43,14 @@ def ensure_df(obj, expected_cols=None) -> pd.DataFrame:
     if isinstance(obj, pd.DataFrame):
         df = obj.copy()
     elif isinstance(obj, dict):
-        # kan een kolom->lijst dict zijn of een speciale structuur; probeer DataFrame
         try:
             df = pd.DataFrame(obj)
         except Exception:
-            # misschien {index: {col: val}}
             try:
                 df = pd.DataFrame.from_dict(obj, orient="index")
             except Exception:
                 df = pd.DataFrame()
     elif isinstance(obj, list):
-        # lijst van dicts of waarden -> DataFrame
         try:
             df = pd.DataFrame(obj)
         except Exception:
@@ -64,14 +61,10 @@ def ensure_df(obj, expected_cols=None) -> pd.DataFrame:
     if expected_cols:
         for c in expected_cols:
             if c not in df.columns:
-                # vul met lege of 0 afhankelijk van kolom
-                if c in ["Referentie", "Leverancier"]:
-                    df[c] = ""
-                elif c in ["EAN"]:
+                if c in ["Referentie", "Leverancier", "EAN"]:
                     df[c] = ""
                 else:
                     df[c] = 0
-        # volgorde forceren
         df = df[expected_cols]
     return df
 
@@ -188,7 +181,9 @@ def set_setting(key, value):
     cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, str(value)))
     c.commit(); c.close()
 
-# ---- prijzen
+# ---- prijzen laden/opslaan ---- #
+PRICE_COLS = ["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
+
 def load_prices():
     init_db()
     c=db()
@@ -197,8 +192,7 @@ def load_prices():
         "Leverancier, MOQ, Levertijd_dagen AS 'Levertijd (dagen)' FROM prices", c)
     c.close()
     if df.empty:
-        df=pd.DataFrame(columns=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten",
-                                 "Leverancier","MOQ","Levertijd (dagen)"])
+        df=pd.DataFrame(columns=PRICE_COLS)
     for col in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         df[col]=pd.to_numeric(df[col], errors="coerce").fillna(0)
     df["EAN"]=df["EAN"].astype(str).str.strip()
@@ -206,16 +200,16 @@ def load_prices():
     df["Leverancier"]=df.get("Leverancier","").astype(str)
     return df
 
-def save_prices(df):
+def save_prices_full(df_full: pd.DataFrame):
+    """Volledige vervanging. Gebruik dit alleen als je bewust alles overschrijft."""
     init_db()
-    need=["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
-    # maak veilig
-    df = ensure_df(df, need)
-    df["EAN"]=df["EAN"].astype(str).str.strip()
-    df["Referentie"]=df["Referentie"].astype(str).str.strip()
-    df["Leverancier"]=df["Leverancier"].astype(str).str.strip()
+    df_full = ensure_df(df_full, PRICE_COLS)
+    # normaliseer
+    df_full["EAN"]=df_full["EAN"].astype(str).str.strip()
+    df_full["Referentie"]=df_full["Referentie"].astype(str).str.strip()
+    df_full["Leverancier"]=df_full["Leverancier"].astype(str).str.strip()
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
-        df[c]=pd.to_numeric(df[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
+        df_full[c]=pd.to_numeric(df_full[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
     c=db(); cur=c.cursor()
     cur.execute("DELETE FROM prices")
     cur.executemany("""
@@ -226,11 +220,46 @@ def save_prices(df):
         (r.EAN, str(r["Referentie"] or ""), float(r["Verkoopprijs"]), float(r["Inkoopprijs"]),
          float(r["Verzendkosten"]), float(r["Overige kosten"]), str(r["Leverancier"] or ""),
          int(r["MOQ"] or 1), int(r["Levertijd (dagen)"] or 0))
-        for _, r in df.iterrows() if str(r["EAN"]).strip()!=""
+        for _, r in df_full.iterrows() if str(r["EAN"]).strip()!=""
     ])
     c.commit(); c.close()
 
-# ---- suppliers
+def upsert_prices_partial(df_partial: pd.DataFrame):
+    """Merge alleen wat de editor teruggeeft (kan 1 rij/1 kolom zijn) met de bestaande prijzen."""
+    base = load_prices().set_index("EAN")
+    part = ensure_df(df_partial, PRICE_COLS).copy()
+    part["EAN"] = part["EAN"].astype(str).str.strip()
+    part = part[part["EAN"]!=""]
+    # normaliseer numeric types
+    for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
+        part[c]=pd.to_numeric(part[c].astype(str).str.replace(",",".",regex=False), errors="coerce")
+
+    for _, r in part.iterrows():
+        e = r["EAN"]
+        if e not in base.index:
+            # maak nieuwe rij met defaults en zet wat we binnen krijgen
+            base.loc[e] = {col: 0 for col in PRICE_COLS if col not in ["EAN","Referentie","Leverancier"]}
+            base.at[e, "Referentie"] = ""
+            base.at[e, "Leverancier"] = ""
+        # update per kolom alleen als waarde niet NaN en niet None (string leeg = mag leeg)
+        for col in PRICE_COLS:
+            if col == "EAN": 
+                continue
+            val = r[col]
+            if pd.isna(val):
+                # niets doen; behoud bestaande
+                continue
+            # strings strippen
+            if isinstance(val, str):
+                base.at[e, col] = val.strip()
+            else:
+                # numeriek
+                base.at[e, col] = float(val) if col not in ["MOQ","Levertijd (dagen)"] else int(val)
+
+    # terug naar DB
+    save_prices_full(base.reset_index())
+
+# ---- suppliers ---- #
 def load_suppliers():
     init_db()
     c=db()
@@ -268,7 +297,7 @@ def delete_supplier(name: str):
     cur.execute("DELETE FROM suppliers WHERE Naam=?", (name,))
     c.commit(); c.close()
 
-# ---- incoming
+# ---- incoming ---- #
 def load_incoming():
     init_db()
     c=db()
@@ -290,7 +319,7 @@ def delete_incoming_row(row_id: int):
     cur.execute("DELETE FROM incoming WHERE id=?", (int(row_id),))
     c.commit(); c.close()
 
-# ---- base_data
+# ---- base_data ---- #
 def load_base_df():
     init_db()
     c=db()
@@ -451,29 +480,20 @@ def _save_home_main_callback():
     up = edited[["EAN","Leverancier"]].copy()
     up["EAN"]=up["EAN"].astype(str).str.strip()
     up["Leverancier"]=up["Leverancier"].astype(str).str.strip()
-    prices = load_prices().copy().set_index("EAN")
-    for _, r in up.iterrows():
-        e = r["EAN"]
-        if not e: continue
-        if e not in prices.index:
-            prices.loc[e] = {
-                "Referentie":"", "Verkoopprijs":0, "Inkoopprijs":0, "Verzendkosten":0,
-                "Overige kosten":0, "Leverancier":r["Leverancier"], "MOQ":1, "Levertijd (dagen)":0
-            }
-        else:
-            prices.at[e,"Leverancier"] = r["Leverancier"]
-    save_prices(prices.reset_index())
+    # Gebruik upsert zodat alleen gekozen kolom wijzigt
+    upsert_prices_partial(up)
     st.session_state["_home_hash"] = df_hash(edited, ["EAN","Leverancier"])
     st.toast("Leveranciers opgeslagen ✅", icon="✅")
 
 def _save_prices_callback():
-    expected = ["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
+    expected = PRICE_COLS
     edited = ensure_df(st.session_state.get("prices_editor_table"), expected)
     if edited.empty:
         return
-    save_prices(edited)
-    st.session_state["_prices_hash"] = df_hash(edited)
-    st.toast("Prijzen opgeslagen ✅", icon="✅")
+    # Merge alle celwijzigingen met bestaande prijzen:
+    upsert_prices_partial(edited)
+    st.session_state["_prices_hash"] = df_hash(load_prices())
+    st.toast("Wijzigingen opgeslagen ✅", icon="✅")
 
 # ============ Pages ============ #
 if choice == "Home":
