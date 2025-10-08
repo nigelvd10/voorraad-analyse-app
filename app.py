@@ -1,10 +1,10 @@
-# app.py — Eén tabel, debounced autosave, Bol-upload + "Inkomende zending" kolom
+# app.py — Eén tabel, debounced autosave, Bol-upload + "Inkomende zending" kolom (met veilige datumvergelijking)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 import sqlite3, os, re, hashlib, time
-from datetime import date
+from datetime import date  # alleen voor titels/labels, geen vergelijkingen
 
 st.set_page_config(page_title="Voorraad App", layout="wide")
 
@@ -358,21 +358,22 @@ def upload_base_ui():
         except Exception as e:
             st.error(f"Kon Excel niet lezen: {e}")
 
-# ============ Merge helper ============ #
+# ============ Merge helper (met veilige datumvergelijking) ============ #
 def merged_inventory(prices_df=None):
     base = st.session_state.base_df
-    if base is None: return None
+    if base is None: 
+        return None
     base = base.copy()
     prices = prices_df if prices_df is not None else load_prices().copy()
     incoming = load_incoming().copy()
 
     base["EAN"] = base["EAN"].astype(str).str.strip()
 
-    # Som van alle toekomstige/ongeplande inkomende aantallen per EAN
+    # Som van alle toekomstige/ongedateerde inkomende aantallen per EAN — veilig met Timestamp
     if not incoming.empty:
-        try: incoming["ETA"] = pd.to_datetime(incoming["ETA"]).dt.date
-        except Exception: pass
-        future = incoming[incoming["ETA"].isna() | (incoming["ETA"] >= date.today())]
+        incoming["ETA_dt"] = pd.to_datetime(incoming["ETA"], errors="coerce")
+        today_ts = pd.Timestamp.today().normalize()
+        future = incoming[incoming["ETA_dt"].isna() | (incoming["ETA_dt"] >= today_ts)]
         inc_sum = future.groupby("EAN")["Aantal"].sum(min_count=1).fillna(0)
     else:
         inc_sum = pd.Series(dtype=float)
@@ -500,7 +501,6 @@ if choice == "Home":
     if inv is None: st.stop()
 
     over_units = int(st.secrets.get("over_units_default", 30))
-    # Gebruik "Inkomende zending" i.p.v. oude "Incoming"
     inv["Status"] = inv.apply(lambda r: (
         "Out of stock" if (float(r.get("Vrije voorraad",0))+float(r.get("Inkomende zending",0)))<=0 else
         ("At risk" if (float(r.get("Vrije voorraad",0))+float(r.get("Inkomende zending",0)))<
@@ -540,7 +540,7 @@ elif choice == "Inventory":
     # -------- ÉÉN BEWERKBARE TABEL + DEBOUNCED AUTOSAVE -------- #
     st.subheader("Overzicht producten (bewerkbaar • autosave)")
 
-    # Altijd buffer gebruiken
+    # Altijd buffer verversen uit merge (zodat 'Inkomende zending' meteen klopt)
     st.session_state.last_inventory_df = merged_inventory(prices_df=st.session_state.prices_df)
     inv_buffer = st.session_state.last_inventory_df.copy()
 
@@ -691,7 +691,7 @@ elif choice == "Incoming":
         st.info("Nog geen inkomende zendingen.")
     else:
         inc_disp = inc.copy()
-        try: inc_disp["ETA"] = pd.to_datetime(inc_disp["ETA"]).dt.date
+        try: inc_disp["ETA"] = pd.to_datetime(inc_disp["ETA"], errors="coerce").dt.date
         except Exception: pass
         st.dataframe(inc_disp, use_container_width=True)
         st.markdown("Rij verwijderen")
