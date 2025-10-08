@@ -1,9 +1,9 @@
-# app.py — één bewerkbare Inventory-tabel met robuuste autosave
+# app.py — Inventory met één tabel + debounced autosave (stabiel, geen "2x invullen")
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-import sqlite3, os, re, hashlib
+import sqlite3, os, re, hashlib, time
 from datetime import date
 
 st.set_page_config(page_title="Voorraad App", layout="wide")
@@ -148,7 +148,6 @@ def init_db():
     c.commit(); c.close()
 
 def invalidate_caches():
-    # Na een save caches legen zodat volgende "echte" refresh vers uit DB leest
     try:
         st.cache_data.clear()
     except Exception:
@@ -381,7 +380,7 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
-# ===== Session-state buffers =====
+# ===== Session-state buffers & debounce keys =====
 if "prices_df" not in st.session_state:
     st.session_state.prices_df = load_prices()
 if "_prices_hash" not in st.session_state:
@@ -389,8 +388,17 @@ if "_prices_hash" not in st.session_state:
 if "_base_hash" not in st.session_state:
     st.session_state._base_hash = df_hash(st.session_state.base_df, REQ_ORDER) if st.session_state.base_df is not None else "empty"
 if "last_inventory_df" not in st.session_state:
-    # Eerste render: merge uit DB en vastzetten als “waarheid” voor de huidige sessie
     st.session_state.last_inventory_df = merged_inventory(prices_df=st.session_state.prices_df)
+
+# Debounce-buffers (tegen "2x invullen")
+if "_inv_last_saved_hash" not in st.session_state:
+    st.session_state._inv_last_saved_hash = "empty"
+if "_inv_last_seen_hash" not in st.session_state:
+    st.session_state._inv_last_seen_hash = "empty"
+if "_inv_last_change_ts" not in st.session_state:
+    st.session_state._inv_last_change_ts = 0.0
+if "_inv_debounce_ms" not in st.session_state:
+    st.session_state._inv_debounce_ms = 700  # wacht 700ms stilte voor opslaan
 
 # ============ Pages ============ #
 if choice == "Home":
@@ -435,10 +443,10 @@ elif choice == "Inventory":
         st.info("Upload eerst je basisbestand (wordt automatisch opgeslagen).")
         upload_base_ui()
 
-    # -------- ÉÉN BEWERKBARE TABEL + AUTOSAVE (buffered) -------- #
+    # -------- ÉÉN BEWERKBARE TABEL + DEBOUNCED AUTOSAVE -------- #
     st.subheader("Overzicht producten (bewerkbaar • autosave)")
 
-    # 1) Gebruik ALTIJD de buffer (last_inventory_df) voor weergave
+    # 1) Toon ALTIJD de buffered versie (blijft staan tijdens reruns)
     inv_buffer = st.session_state.last_inventory_df.copy()
 
     INV_COLS = [
@@ -486,12 +494,11 @@ elif choice == "Inventory":
     edited["Titel"] = edited["Titel"].astype(str).str.strip()
     edited["Leverancier"] = edited["Leverancier"].astype(str).str.strip()
 
-    # 3) Schrijf EERST naar buffers in session_state (zodat rerun dezelfde data laat zien)
+    # 3) Schrijf EERST naar buffer (display blijft stabiel tijdens reruns)
     st.session_state.last_inventory_df = edited.copy()
 
-    # 4) Maak base/prices datasets uit de editor-gegevens
+    # 4) Maak datasets voor opslag
     base_out = edited[["EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)"]].copy()
-    # behoud Verkopen (Totaal) vanuit bestaande base_df
     if st.session_state.base_df is not None and "Verkopen (Totaal)" in st.session_state.base_df.columns:
         sales_map = st.session_state.base_df.set_index("EAN")["Verkopen (Totaal)"]
         base_out["Verkopen (Totaal)"] = base_out["EAN"].map(sales_map).fillna(0)
@@ -502,27 +509,41 @@ elif choice == "Inventory":
 
     prices_out = edited[["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]].copy()
 
-    base_out = base_out[base_out["EAN"].str.len()>0]
-    prices_out = prices_out[prices_out["EAN"].str.len()>0]
+    # Filter lege EAN
+    base_out   = base_out[base_out["EAN"].str.len() > 0]
+    prices_out = prices_out[prices_out["EAN"].str.len() > 0]
 
-    new_base_hash = df_hash(base_out, REQ_ORDER)
-    new_prices_hash = df_hash(prices_out, PRICE_COLS)
+    # 5) Debounce: wacht tot invoer even stil is, dán pas saven
+    cur_hash = df_hash(pd.concat(
+        [base_out.reset_index(drop=True), prices_out.reset_index(drop=True)], axis=1
+    ))
 
-    # 5) Dan pas DB-save (en daarna cache invalidatie). Bij succes updaten we ook de hashes + in-memory kopieën.
-    changed = False
-    if new_base_hash != st.session_state._base_hash:
-        save_base_df(base_out)
-        st.session_state.base_df = base_out.copy()
-        st.session_state._base_hash = new_base_hash
-        changed = True
-    if new_prices_hash != st.session_state._prices_hash:
-        save_prices_full(prices_out)
-        st.session_state.prices_df = prices_out.copy()
-        st.session_state._prices_hash = new_prices_hash
-        changed = True
+    if cur_hash != st.session_state._inv_last_seen_hash:
+        st.session_state._inv_last_seen_hash = cur_hash
+        st.session_state._inv_last_change_ts = time.time()
+    else:
+        quiet_ms = (time.time() - st.session_state._inv_last_change_ts) * 1000.0
+        if (cur_hash != st.session_state._inv_last_saved_hash) and (quiet_ms >= st.session_state._inv_debounce_ms):
+            # Sla op (stabiele invoer)
+            new_base_hash   = df_hash(base_out, REQ_ORDER)
+            new_prices_hash = df_hash(prices_out, PRICE_COLS)
 
-    if changed:
-        st.toast("Wijzigingen automatisch opgeslagen ✅", icon="✅")
+            changed = False
+            if new_base_hash != st.session_state._base_hash:
+                save_base_df(base_out)
+                st.session_state.base_df    = base_out.copy()
+                st.session_state._base_hash = new_base_hash
+                changed = True
+
+            if new_prices_hash != st.session_state._prices_hash:
+                save_prices_full(prices_out)
+                st.session_state.prices_df    = prices_out.copy()
+                st.session_state._prices_hash = new_prices_hash
+                changed = True
+
+            if changed:
+                st.session_state._inv_last_saved_hash = cur_hash
+                st.toast("Automatisch opgeslagen ✅", icon="✅")
 
 elif choice == "Suppliers":
     st.header("Suppliers")
