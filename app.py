@@ -1,4 +1,4 @@
-# app.py — Inventory met één tabel + debounced autosave (stabiel, geen "2x invullen")
+# app.py — Inventory met één tabel, debounced autosave + Bol.com upload (prognose & voorraad dagen)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -52,7 +52,8 @@ def ensure_df(obj, expected_cols=None) -> pd.DataFrame:
         for c in expected_cols:
             if c not in df.columns:
                 df[c] = "" if c in ["EAN","Referentie","Leverancier","Titel"] else 0
-        df = df[expected_cols]
+        # volgorde forceren (extra kolommen laat je gewoon bestaan)
+        df = df[[c for c in expected_cols if c in df.columns] + [c for c in df.columns if c not in expected_cols]]
     return df
 
 # ============ Kolom-detectie ============ #
@@ -65,8 +66,11 @@ PATTERNS = {
     "sales_total": [r"verkopen\s*\(\s*totaal\s*\)", r"verkopen.*totaal", r"totaal.*verkopen", r"sales\s*total"],
     "forecast_min_4w": [r"verkoopprognose.*4\s*w", r"forecast.*4", r"prognose.*4\s*w",
                         r"verkoopprognose\s*min\s*\(\s*totaal\s*4\s*w\s*\)"],
+    # nieuw: Voorraad dagen
+    "stock_days": [r"voorraad\s*dagen", r"dagen\s*voorraad", r"days\s*of\s*supply", r"dos\b", r"voorraad\s*in\s*dagen"],
 }
 REQ_ORDER = ["EAN","Referentie","Titel","Vrije voorraad","Verkopen (Totaal)","Verkoopprognose min (Totaal 4w)"]
+BASE_COLS = REQ_ORDER + ["Voorraad dagen"]
 
 def auto_map(df):
     m={}
@@ -138,14 +142,21 @@ def init_db():
         Titel TEXT,
         Vrije_voorraad REAL,
         Verkopen_Totaal REAL,
-        Verkoopprognose_min_Totaal4w INTEGER
+        Verkoopprognose_min_Totaal4w INTEGER,
+        Voorraad_dagen INTEGER
     )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
-    c.commit(); c.close()
+    c.commit()
+
+    # Migrations: voeg kolom Voorraad_dagen toe wanneer oudere DB
+    cur.execute("PRAGMA table_info(base_data)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "Voorraad_dagen" not in cols:
+        try:
+            cur.execute("ALTER TABLE base_data ADD COLUMN Voorraad_dagen INTEGER")
+            c.commit()
+        except Exception:
+            pass
+    c.close()
 
 def invalidate_caches():
     try:
@@ -270,7 +281,8 @@ def load_base_df():
         SELECT EAN, Referentie, Titel,
                Vrije_voorraad AS 'Vrije voorraad',
                Verkopen_Totaal AS 'Verkopen (Totaal)',
-               Verkoopprognose_min_Totaal4w AS 'Verkoopprognose min (Totaal 4w)'
+               Verkoopprognose_min_Totaal4w AS 'Verkoopprognose min (Totaal 4w)',
+               Voorraad_dagen AS 'Voorraad dagen'
         FROM base_data
     """, c)
     c.close()
@@ -278,24 +290,61 @@ def load_base_df():
 
 def save_base_df(df):
     init_db()
-    df = ensure_df(df, REQ_ORDER)
+    # laat zowel REQ_ORDER als Voorraad dagen toe
+    df = ensure_df(df, BASE_COLS)
+    # splits kolommen (sommige bestaan mogelijk nog niet)
+    have_cols = set(df.columns)
+    cols = {
+        "EAN": "EAN" in have_cols,
+        "Referentie": "Referentie" in have_cols,
+        "Titel": "Titel" in have_cols,
+        "Vrije_voorraad": "Vrije voorraad" in have_cols,
+        "Verkopen_Totaal": "Verkopen (Totaal)" in have_cols,
+        "Verkoopprognose_min_Totaal4w": "Verkoopprognose min (Totaal 4w)" in have_cols,
+        "Voorraad_dagen": "Voorraad dagen" in have_cols,
+    }
+    # Lees huidige DB om bestaande waarden te behouden als ze niet in df zitten
+    cur_df = load_base_df()
+    if cur_df is None: cur_df = pd.DataFrame(columns=["EAN"])
+
+    # Merge op EAN (update bestaande rijen en voeg nieuwe toe)
+    merged = cur_df.merge(df, on="EAN", how="outer", suffixes=("_db",""))
+    def pick(col_db, col_new):
+        if col_new in merged.columns:
+            return merged[col_new]
+        elif col_db in merged.columns:
+            return merged[col_db]
+        else:
+            return 0
+
+    out = pd.DataFrame({
+        "EAN": merged["EAN"].astype(str).str.strip(),
+        "Referentie": (merged["Referentie"] if "Referentie" in merged.columns else merged.get("Referentie_db","")).astype(str),
+        "Titel": (merged["Titel"] if "Titel" in merged.columns else merged.get("Titel_db","")).astype(str),
+        "Vrije_voorraad": pd.to_numeric(pick("Vrije voorraad_db","Vrije voorraad"), errors="coerce").fillna(0),
+        "Verkopen_Totaal": pd.to_numeric(pick("Verkopen (Totaal)_db","Verkopen (Totaal)"), errors="coerce").fillna(0),
+        "Verkoopprognose_min_Totaal4w": pd.to_numeric(pick("Verkoopprognose min (Totaal 4w)_db","Verkoopprognose min (Totaal 4w)"), errors="coerce").fillna(0).astype(int),
+        "Voorraad_dagen": pd.to_numeric(pick("Voorraad dagen_db","Voorraad dagen"), errors="coerce"),
+    })
+
     c=db(); cur=c.cursor()
     cur.execute("DELETE FROM base_data")
     cur.executemany("""
         INSERT OR REPLACE INTO base_data
-        (EAN, Referentie, Titel, Vrije_voorraad, Verkopen_Totaal, Verkoopprognose_min_Totaal4w)
-        VALUES (?,?,?,?,?,?)
+        (EAN, Referentie, Titel, Vrije_voorraad, Verkopen_Totaal, Verkoopprognose_min_Totaal4w, Voorraad_dagen)
+        VALUES (?,?,?,?,?,?,?)
     """, [
         (r.EAN, str(r.Referentie or ""), str(r.Titel or ""),
-         float(r["Vrije voorraad"] or 0),
-         float(r["Verkopen (Totaal)"] or 0),
-         int(r["Verkoopprognose min (Totaal 4w)"] or 0))
-        for _, r in df.iterrows() if str(r.EAN).strip()!=""
+         float(r["Vrije_voorraad"] or 0),
+         float(r["Verkopen_Totaal"] or 0),
+         int(r["Verkoopprognose_min_Totaal4w"] or 0),
+         None if pd.isna(r["Voorraad_dagen"]) else int(r["Voorraad_dagen"]))
+        for _, r in out.iterrows() if str(r.EAN).strip()!=""
     ])
     c.commit(); c.close()
     invalidate_caches()
 
-# ============ Basisdata upload UI ============ #
+# ============ Basisdata upload UI (eerste keer) ============ #
 if "base_df" not in st.session_state:
     st.session_state.base_df = load_base_df()
 
@@ -364,6 +413,10 @@ def merged_inventory(prices_df=None):
     for ccol in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         base[ccol] = pd.to_numeric(base[ccol].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
+    # Voorraad dagen meenemen (kan leeg zijn)
+    if "Voorraad dagen" not in base.columns:
+        base["Voorraad dagen"] = np.nan
+
     base["Voorraadwaarde (verkoop)"] = base["Vrije voorraad"] * base["Verkoopprijs"].fillna(0)
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
     return base
@@ -386,11 +439,11 @@ if "prices_df" not in st.session_state:
 if "_prices_hash" not in st.session_state:
     st.session_state._prices_hash = df_hash(st.session_state.prices_df, PRICE_COLS)
 if "_base_hash" not in st.session_state:
-    st.session_state._base_hash = df_hash(st.session_state.base_df, REQ_ORDER) if st.session_state.base_df is not None else "empty"
+    st.session_state._base_hash = df_hash(st.session_state.base_df, BASE_COLS) if st.session_state.base_df is not None else "empty"
 if "last_inventory_df" not in st.session_state:
     st.session_state.last_inventory_df = merged_inventory(prices_df=st.session_state.prices_df)
 
-# Debounce-buffers (tegen "2x invullen")
+# Debounce-buffers
 if "_inv_last_saved_hash" not in st.session_state:
     st.session_state._inv_last_saved_hash = "empty"
 if "_inv_last_seen_hash" not in st.session_state:
@@ -399,6 +452,76 @@ if "_inv_last_change_ts" not in st.session_state:
     st.session_state._inv_last_change_ts = 0.0
 if "_inv_debounce_ms" not in st.session_state:
     st.session_state._inv_debounce_ms = 700  # wacht 700ms stilte voor opslaan
+
+# ============ Upload helpers voor Inventory (Bol.com) ============ #
+def upload_bol_forecast_ui():
+    st.markdown("#### Upload Bol.com prognose (.xlsx) — vult **Verkoopprognose min (Totaal 4w)** & **Voorraad dagen** automatisch")
+    up = st.file_uploader("Sleep je Bol.com export hier", type=["xlsx"], key="bolfile")
+    if not up:
+        return
+    try:
+        sheets = read_excel_all(up)
+        # Kies automatisch sheet met meeste kolommen; laat dropdown voor controle
+        default_sheet = max(sheets.items(), key=lambda kv: kv[1].shape[1])[0]
+        sheet = st.selectbox("Kies sheet", list(sheets.keys()), index=list(sheets.keys()).index(default_sheet))
+        raw = sheets[sheet]
+        st.caption(f"Voorbeeld (eerste 8 rijen) — {raw.shape[0]} rijen, {raw.shape[1]} kolommen")
+        st.dataframe(raw.head(8), use_container_width=True)
+
+        auto = auto_map(raw)
+        # verplichte kolommen voor dit uploadje:
+        need_map = {
+            "ean": "EAN *",
+            "forecast_min_4w": "Verkoopprognose min (Totaal 4w) *",
+            "stock_days": "Voorraad dagen *",
+        }
+        picks = {}
+        for key, label in need_map.items():
+            opts = list(raw.columns)
+            idx = opts.index(auto.get(key)) if auto.get(key) in opts else 0
+            picks[key] = st.selectbox(label, opts, index=idx, key=f"pick_{key}")
+
+        if st.button("📥 Gegevens inladen", type="primary"):
+            df = pd.DataFrame({
+                "EAN": raw[picks["ean"]].astype(str).str.strip(),
+                "Verkoopprognose min (Totaal 4w)": to_int(raw[picks["forecast_min_4w"]]),
+                "Voorraad dagen": pd.to_numeric(raw[picks["stock_days"]], errors="coerce"),
+            })
+            # Aggregeren wanneer dubbele EANs voorkomen: neem minimum prognose en minimum voorraad-dagen
+            agg = df.groupby("EAN").agg({
+                "Verkoopprognose min (Totaal 4w)": "min",
+                "Voorraad dagen": "min",
+            }).reset_index()
+
+            # Merge met huidige base_df, maar overschrijf alleen deze twee velden
+            current = st.session_state.base_df if st.session_state.base_df is not None else pd.DataFrame(columns=["EAN"])
+            merged = current.merge(agg, on="EAN", how="outer", suffixes=("","_new"))
+
+            def pick_or(old_col, new_col):
+                if new_col in merged.columns:
+                    return merged[new_col].where(~merged[new_col].isna(), merged.get(old_col))
+                return merged.get(old_col)
+
+            out = current.copy()
+            out = merged.copy()
+            # Zorg dat verplichte kolommen bestaan
+            for c in BASE_COLS:
+                if c not in out.columns:
+                    out[c] = np.nan if c == "Voorraad dagen" else 0
+            # Overschrijf targets
+            out["Verkoopprognose min (Totaal 4w)"] = pick_or("Verkoopprognose min (Totaal 4w)", "Verkoopprognose min (Totaal 4w)")
+            out["Voorraad dagen"] = pick_or("Voorraad dagen", "Voorraad dagen")
+            # Kolommen netjes
+            out = ensure_df(out, BASE_COLS)
+
+            save_base_df(out)
+            st.session_state.base_df = out.copy()
+            st.session_state._base_hash = df_hash(out, BASE_COLS)
+            # Buffer vernieuwen met nieuwe merge
+            st.session_state.last_inventory_df = merged_inventory(prices_df=st.session_state.prices_df)
+            st.success("Prognose & Voorraad dagen ingeladen ✅")
+    except Exception as e:
+        st.error(f"Upload mislukt: {e}")
 
 # ============ Pages ============ #
 if choice == "Home":
@@ -443,19 +566,22 @@ elif choice == "Inventory":
         st.info("Upload eerst je basisbestand (wordt automatisch opgeslagen).")
         upload_base_ui()
 
+    # -------- Upload Bol.com prognose/voorraad-dagen -------- #
+    upload_bol_forecast_ui()
+
     # -------- ÉÉN BEWERKBARE TABEL + DEBOUNCED AUTOSAVE -------- #
     st.subheader("Overzicht producten (bewerkbaar • autosave)")
 
-    # 1) Toon ALTIJD de buffered versie (blijft staan tijdens reruns)
+    # 1) Toon ALTIJD de buffered versie
     inv_buffer = st.session_state.last_inventory_df.copy()
 
     INV_COLS = [
-        "EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)",
+        "EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)","Voorraad dagen",
         "Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"
     ]
     for c in INV_COLS:
         if c not in inv_buffer.columns:
-            inv_buffer[c] = "" if c in ["Referentie","Titel","Leverancier"] else 0
+            inv_buffer[c] = "" if c in ["Referentie","Titel","Leverancier"] else (np.nan if c=="Voorraad dagen" else 0)
     inv_view = inv_buffer[INV_COLS].copy()
 
     options = [""] + sorted(set(load_suppliers().get("Naam", pd.Series(dtype=str)).dropna().astype(str).tolist()))
@@ -466,6 +592,8 @@ elif choice == "Inventory":
         "Referentie": st.column_config.TextColumn("Referentie"),
         "Vrije voorraad": st.column_config.NumberColumn(step=1, min_value=0),
         "Verkoopprognose min (Totaal 4w)": st.column_config.NumberColumn(step=1, min_value=0),
+        # Voorraad dagen komt uit upload -> read-only
+        "Voorraad dagen": st.column_config.NumberColumn(step=1, disabled=True),
         "Verkoopprijs": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.01),
         "Inkoopprijs": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.01),
         "Verzendkosten": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.01),
@@ -483,7 +611,7 @@ elif choice == "Inventory":
         column_config=col_cfg,
     )
 
-    # 2) Normaliseren
+    # 2) Normaliseren (let op: Voorraad dagen blijft zoals is; niet casten naar int als NaN toegestaan)
     edited = ensure_df(edited, INV_COLS)
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten"]:
         edited[c] = pd.to_numeric(edited[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0.0)
@@ -493,19 +621,23 @@ elif choice == "Inventory":
     edited["Referentie"] = edited["Referentie"].astype(str).str.strip()
     edited["Titel"] = edited["Titel"].astype(str).str.strip()
     edited["Leverancier"] = edited["Leverancier"].astype(str).str.strip()
+    edited["Voorraad dagen"] = pd.to_numeric(edited["Voorraad dagen"], errors="coerce")  # kan NaN blijven
 
     # 3) Schrijf EERST naar buffer (display blijft stabiel tijdens reruns)
     st.session_state.last_inventory_df = edited.copy()
 
     # 4) Maak datasets voor opslag
-    base_out = edited[["EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)"]].copy()
+    base_out = edited[["EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)","Voorraad dagen"]].copy()
+    # behoud Verkopen (Totaal) vanuit bestaande base_df
     if st.session_state.base_df is not None and "Verkopen (Totaal)" in st.session_state.base_df.columns:
         sales_map = st.session_state.base_df.set_index("EAN")["Verkopen (Totaal)"]
         base_out["Verkopen (Totaal)"] = base_out["EAN"].map(sales_map).fillna(0)
-        base_out = base_out[["EAN","Referentie","Titel","Vrije voorraad","Verkopen (Totaal)","Verkoopprognose min (Totaal 4w)"]]
+        base_out = base_out[["EAN","Referentie","Titel","Vrije voorraad","Verkopen (Totaal)",
+                             "Verkoopprognose min (Totaal 4w)","Voorraad dagen"]]
     else:
         base_out["Verkopen (Totaal)"] = 0
-        base_out = base_out[REQ_ORDER]
+        base_out = base_out[["EAN","Referentie","Titel","Vrije voorraad","Verkopen (Totaal)",
+                             "Verkoopprognose min (Totaal 4w)","Voorraad dagen"]]
 
     prices_out = edited[["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]].copy()
 
@@ -525,8 +657,8 @@ elif choice == "Inventory":
         quiet_ms = (time.time() - st.session_state._inv_last_change_ts) * 1000.0
         if (cur_hash != st.session_state._inv_last_saved_hash) and (quiet_ms >= st.session_state._inv_debounce_ms):
             # Sla op (stabiele invoer)
-            new_base_hash   = df_hash(base_out, REQ_ORDER)
-            new_prices_hash = df_hash(prices_out, PRICE_COLS)
+            new_base_hash   = df_hash(base_out, base_out.columns.tolist())
+            new_prices_hash = df_hash(prices_out, prices_out.columns.tolist())
 
             changed = False
             if new_base_hash != st.session_state._base_hash:
