@@ -1,4 +1,4 @@
-# app.py — één bewerkbare Inventory-tabel met autosave (alles)
+# app.py — één bewerkbare Inventory-tabel met robuuste autosave
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -55,7 +55,7 @@ def ensure_df(obj, expected_cols=None) -> pd.DataFrame:
         df = df[expected_cols]
     return df
 
-# ============ Kolom-detectie (incl. Referentie) ============ #
+# ============ Kolom-detectie ============ #
 PATTERNS = {
     "ean": [r"^\s*ean\s*$", r"\bgtin\b", r"^\s*barcode\s*$", r"^\s*upc\s*$"],
     "ref": [r"^\s*referentie\s*$", r"^ref$", r"\breference\b", r"^\s*sku\s*$",
@@ -147,20 +147,17 @@ def init_db():
     )""")
     c.commit(); c.close()
 
-def get_setting(key, default=None):
-    c=db(); cur=c.cursor()
-    cur.execute("SELECT value FROM settings WHERE key=?", (key,))
-    r=cur.fetchone(); c.close()
-    return r[0] if r else default
-
-def set_setting(key, value):
-    c=db(); cur=c.cursor()
-    cur.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)",(key,str(value)))
-    c.commit(); c.close()
+def invalidate_caches():
+    # Na een save caches legen zodat volgende "echte" refresh vers uit DB leest
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 # ---- prijzen ---- #
 PRICE_COLS = ["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
 
+@st.cache_data(ttl=0.1)
 def load_prices():
     init_db()
     c=db()
@@ -197,8 +194,10 @@ def save_prices_full(df_full: pd.DataFrame):
         for _, r in df_full.iterrows() if str(r["EAN"]).strip()!=""
     ])
     c.commit(); c.close()
+    invalidate_caches()
 
 # ---- suppliers ---- #
+@st.cache_data(ttl=0.1)
 def load_suppliers():
     init_db()
     c=db()
@@ -230,13 +229,16 @@ def save_suppliers(df):
          for _, r in df.iterrows() if r.Naam]
     )
     c.commit(); c.close()
+    invalidate_caches()
 
 def delete_supplier(name: str):
     c=db(); cur=c.cursor()
     cur.execute("DELETE FROM suppliers WHERE Naam=?", (name,))
     c.commit(); c.close()
+    invalidate_caches()
 
 # ---- incoming ---- #
+@st.cache_data(ttl=0.1)
 def load_incoming():
     init_db()
     c=db()
@@ -252,13 +254,16 @@ def add_incoming_row(ean, ref, qty, eta, leverancier, note):
     cur.execute("INSERT INTO incoming (EAN, Referentie, Aantal, ETA, Leverancier, Opmerking) VALUES (?,?,?,?,?,?)",
                 (str(ean).strip(), str(ref or ""), int(qty or 0), str(eta) if eta else "", str(leverancier or ""), str(note or "")))
     c.commit(); c.close()
+    invalidate_caches()
 
 def delete_incoming_row(row_id: int):
     c=db(); cur=c.cursor()
     cur.execute("DELETE FROM incoming WHERE id=?", (int(row_id),))
     c.commit(); c.close()
+    invalidate_caches()
 
 # ---- base_data ---- #
+@st.cache_data(ttl=0.1)
 def load_base_df():
     init_db()
     c=db()
@@ -289,6 +294,7 @@ def save_base_df(df):
         for _, r in df.iterrows() if str(r.EAN).strip()!=""
     ])
     c.commit(); c.close()
+    invalidate_caches()
 
 # ============ Basisdata upload UI ============ #
 if "base_df" not in st.session_state:
@@ -363,34 +369,6 @@ def merged_inventory(prices_df=None):
     base["Totale kostprijs per stuk"] = base["Inkoopprijs"].fillna(0) + base["Verzendkosten"].fillna(0) + base["Overige kosten"].fillna(0)
     return base
 
-# ============ Status & advies ============ #
-def classify(row, over_units: int):
-    f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
-    stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
-    if stock_total <= 0: return "Out of stock"
-    if f <= 0: return "Healthy"
-    if stock_total < f: return "At risk"
-    if stock_total >= f + over_units: return "Overstock"
-    return "Healthy"
-
-def recommend(row):
-    f = float(row.get("Verkoopprognose min (Totaal 4w)",0) or 0)
-    stock_total = float(row.get("Vrije voorraad",0) or 0) + float(row.get("Incoming",0) or 0)
-    if f <= 0: return 0
-    target = 1.1*f
-    need = max(0.0, target - stock_total)
-    moq = to_int(row.get("MOQ",1),1)
-    return int(np.ceil(need/max(1,moq))*max(1,moq))
-
-def supplier_options_list():
-    sup_df = load_suppliers()
-    sup_names = sorted(set(sup_df["Naam"].dropna().astype(str).tolist()))
-    if "prices_df" in st.session_state and not st.session_state.prices_df.empty:
-        existing = sorted(set(st.session_state.prices_df.get("Leverancier","").dropna().astype(str).tolist()))
-    else:
-        existing = []
-    return [""] + sorted(set(sup_names + existing))
-
 # ============ Sidebar ============ #
 with st.sidebar:
     st.markdown('<div class="sidebar-title">Menu</div>', unsafe_allow_html=True)
@@ -403,13 +381,16 @@ with st.sidebar:
             choice = p
     st.session_state["_page"] = choice
 
-# ===== Session-state voor prijzen + basis (hash voor autosave) =====
+# ===== Session-state buffers =====
 if "prices_df" not in st.session_state:
     st.session_state.prices_df = load_prices()
 if "_prices_hash" not in st.session_state:
     st.session_state._prices_hash = df_hash(st.session_state.prices_df, PRICE_COLS)
 if "_base_hash" not in st.session_state:
     st.session_state._base_hash = df_hash(st.session_state.base_df, REQ_ORDER) if st.session_state.base_df is not None else "empty"
+if "last_inventory_df" not in st.session_state:
+    # Eerste render: merge uit DB en vastzetten als “waarheid” voor de huidige sessie
+    st.session_state.last_inventory_df = merged_inventory(prices_df=st.session_state.prices_df)
 
 # ============ Pages ============ #
 if choice == "Home":
@@ -420,12 +401,14 @@ if choice == "Home":
     inv = merged_inventory(prices_df=st.session_state.prices_df)
     if inv is None: st.stop()
 
-    over_default = int(get_setting("over_units", 30))
-    over_units = st.number_input("Overstock-drempel (stuks)", min_value=0, value=over_default, step=1)
-    if over_units != over_default:
-        set_setting("over_units", over_units)
-
-    inv["Status"] = inv.apply(lambda r: classify(r, over_units), axis=1)
+    over_units = int(st.secrets.get("over_units_default", 30))
+    inv["Status"] = inv.apply(lambda r: (
+        "Out of stock" if (float(r.get("Vrije voorraad",0))+float(r.get("Incoming",0)))<=0 else
+        ("At risk" if (float(r.get("Vrije voorraad",0))+float(r.get("Incoming",0)))<
+         float(r.get("Verkoopprognose min (Totaal 4w)",0)) else
+         ("Overstock" if (float(r.get("Vrije voorraad",0))+float(r.get("Incoming",0)))>=
+          float(r.get("Verkoopprognose min (Totaal 4w)",0))+over_units else "Healthy"))
+    ), axis=1)
 
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Totale voorraadwaarde (verkoop)", f"€ {inv['Voorraadwaarde (verkoop)'].sum():,.2f}")
@@ -437,15 +420,12 @@ if choice == "Home":
     order = ["Out of stock","At risk","Healthy","Overstock"]
     counts = inv["Status"].value_counts().reindex(order).fillna(0)
     chart_df = pd.DataFrame({"Status":order,"Aantal":[int(counts.get(s,0)) for s in order]})
-    y_max = max(1, int(chart_df["Aantal"].max()))
     color_scale = alt.Scale(domain=order, range=["#E74C3C", "#F39C12", "#27AE60", "#34495E"])
-    chart = (alt.Chart(chart_df)
-             .mark_bar()
-             .encode(
-                 x=alt.X("Status:N", sort=order, title="Status"),
-                 y=alt.Y("Aantal:Q", scale=alt.Scale(domain=(0, y_max)), title="Aantal"),
-                 color=alt.Color("Status:N", scale=color_scale, legend=None),
-             ).properties(height=280))
+    chart = (alt.Chart(chart_df).mark_bar().encode(
+        x=alt.X("Status:N", sort=order, title="Status"),
+        y=alt.Y("Aantal:Q", title="Aantal"),
+        color=alt.Color("Status:N", scale=color_scale, legend=None),
+    ).properties(height=280))
     st.altair_chart(chart, use_container_width=True)
 
 elif choice == "Inventory":
@@ -455,32 +435,28 @@ elif choice == "Inventory":
         st.info("Upload eerst je basisbestand (wordt automatisch opgeslagen).")
         upload_base_ui()
 
-    # -------- ÉÉN BEWERKBARE TABEL + AUTOSAVE -------- #
+    # -------- ÉÉN BEWERKBARE TABEL + AUTOSAVE (buffered) -------- #
     st.subheader("Overzicht producten (bewerkbaar • autosave)")
 
-    inv = merged_inventory(prices_df=st.session_state.prices_df)
-    if inv is None:
-        st.stop()
+    # 1) Gebruik ALTIJD de buffer (last_inventory_df) voor weergave
+    inv_buffer = st.session_state.last_inventory_df.copy()
 
-    # Kolommen die je in deze enkele tabel wil zien/bewerken
     INV_COLS = [
         "EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)",
         "Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"
     ]
     for c in INV_COLS:
-        if c not in inv.columns: inv[c] = "" if c in ["Referentie","Titel","Leverancier"] else 0
-    inv_view = inv[INV_COLS].copy()
+        if c not in inv_buffer.columns:
+            inv_buffer[c] = "" if c in ["Referentie","Titel","Leverancier"] else 0
+    inv_view = inv_buffer[INV_COLS].copy()
 
-    # Kolomconfig (Leverancier als dropdown)
-    options = supplier_options_list()
+    options = [""] + sorted(set(load_suppliers().get("Naam", pd.Series(dtype=str)).dropna().astype(str).tolist()))
     col_cfg = {
-        "Leverancier": st.column_config.SelectboxColumn(
-            "Leverancier", options=options, help="Kies uit Suppliers of laat leeg.", required=False
-        ),
+        "Leverancier": st.column_config.SelectboxColumn("Leverancier", options=options, required=False),
         "EAN": st.column_config.TextColumn("EAN"),
         "Titel": st.column_config.TextColumn("Titel"),
         "Referentie": st.column_config.TextColumn("Referentie"),
-        "Vrije voorraad": st.column_config.NumberColumn("Vrije voorraad", step=1, min_value=0),
+        "Vrije voorraad": st.column_config.NumberColumn(step=1, min_value=0),
         "Verkoopprognose min (Totaal 4w)": st.column_config.NumberColumn(step=1, min_value=0),
         "Verkoopprijs": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.01),
         "Inkoopprijs": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.01),
@@ -499,7 +475,7 @@ elif choice == "Inventory":
         column_config=col_cfg,
     )
 
-    # Normaliseren
+    # 2) Normaliseren
     edited = ensure_df(edited, INV_COLS)
     for c in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten"]:
         edited[c] = pd.to_numeric(edited[c].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0.0)
@@ -510,9 +486,12 @@ elif choice == "Inventory":
     edited["Titel"] = edited["Titel"].astype(str).str.strip()
     edited["Leverancier"] = edited["Leverancier"].astype(str).str.strip()
 
-    # Splits naar base + prices voor opslag
+    # 3) Schrijf EERST naar buffers in session_state (zodat rerun dezelfde data laat zien)
+    st.session_state.last_inventory_df = edited.copy()
+
+    # 4) Maak base/prices datasets uit de editor-gegevens
     base_out = edited[["EAN","Referentie","Titel","Vrije voorraad","Verkoopprognose min (Totaal 4w)"]].copy()
-    # behoud kolom "Verkopen (Totaal)" uit bestaande base_df als die er was
+    # behoud Verkopen (Totaal) vanuit bestaande base_df
     if st.session_state.base_df is not None and "Verkopen (Totaal)" in st.session_state.base_df.columns:
         sales_map = st.session_state.base_df.set_index("EAN")["Verkopen (Totaal)"]
         base_out["Verkopen (Totaal)"] = base_out["EAN"].map(sales_map).fillna(0)
@@ -523,14 +502,13 @@ elif choice == "Inventory":
 
     prices_out = edited[["EAN","Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]].copy()
 
-    # Filter lege EAN-rijen
-    base_out = base_out[base_out["EAN"].str.len() > 0]
-    prices_out = prices_out[prices_out["EAN"].str.len() > 0]
+    base_out = base_out[base_out["EAN"].str.len()>0]
+    prices_out = prices_out[prices_out["EAN"].str.len()>0]
 
-    # Hashes voor autosave
     new_base_hash = df_hash(base_out, REQ_ORDER)
     new_prices_hash = df_hash(prices_out, PRICE_COLS)
 
+    # 5) Dan pas DB-save (en daarna cache invalidatie). Bij succes updaten we ook de hashes + in-memory kopieën.
     changed = False
     if new_base_hash != st.session_state._base_hash:
         save_base_df(base_out)
