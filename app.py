@@ -1,10 +1,10 @@
-# app.py — Eén tabel, debounced autosave, Bol-upload + "Inkomende zending" kolom (met veilige datumvergelijking)
+# app.py — Eén tabel, debounced autosave, Bol-upload + Inkomende zending + ETA (verwachte datum)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
 import sqlite3, os, re, hashlib, time
-from datetime import date  # alleen voor titels/labels, geen vergelijkingen
+from datetime import date  # enkel voor labels, geen vergelijkingen
 
 st.set_page_config(page_title="Voorraad App", layout="wide")
 
@@ -358,7 +358,7 @@ def upload_base_ui():
         except Exception as e:
             st.error(f"Kon Excel niet lezen: {e}")
 
-# ============ Merge helper (met veilige datumvergelijking) ============ #
+# ============ Merge helper (incl. Inkomende zending + ETA) ============ #
 def merged_inventory(prices_df=None):
     base = st.session_state.base_df
     if base is None: 
@@ -369,16 +369,23 @@ def merged_inventory(prices_df=None):
 
     base["EAN"] = base["EAN"].astype(str).str.strip()
 
-    # Som van alle toekomstige/ongedateerde inkomende aantallen per EAN — veilig met Timestamp
+    # Som van toekomstige/ongedateerde inkomende aantallen + eerstvolgende ETA
     if not incoming.empty:
-        incoming["ETA_dt"] = pd.to_datetime(incoming["ETA"], errors="coerce")
+        incoming["ETA_dt"] = pd.to_datetime(incoming["ETA"], errors="coerce").dt.normalize()
         today_ts = pd.Timestamp.today().normalize()
         future = incoming[incoming["ETA_dt"].isna() | (incoming["ETA_dt"] >= today_ts)]
+
         inc_sum = future.groupby("EAN")["Aantal"].sum(min_count=1).fillna(0)
+        eta_min = future.groupby("EAN")["ETA_dt"].min()
+
     else:
         inc_sum = pd.Series(dtype=float)
-    base["Inkomende zending"] = base["EAN"].map(inc_sum).fillna(0).astype(int)
+        eta_min = pd.Series(dtype="datetime64[ns]")
 
+    base["Inkomende zending"] = base["EAN"].map(inc_sum).fillna(0).astype(int)
+    base["ETA (verwachte datum)"] = base["EAN"].map(eta_min)
+
+    # Merge prijzen
     cols = ["Referentie","Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"]
     if not prices.empty:
         base = base.merge(prices[["EAN"]+cols], on="EAN", how="left", suffixes=("_u","_p"))
@@ -389,6 +396,7 @@ def merged_inventory(prices_df=None):
         for ccol in cols:
             base[ccol] = "" if ccol in ["Leverancier","Referentie"] else 0
 
+    # Types
     for ccol in ["Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","MOQ","Levertijd (dagen)"]:
         base[ccol] = pd.to_numeric(base[ccol].astype(str).str.replace(",",".",regex=False), errors="coerce").fillna(0)
 
@@ -540,18 +548,19 @@ elif choice == "Inventory":
     # -------- ÉÉN BEWERKBARE TABEL + DEBOUNCED AUTOSAVE -------- #
     st.subheader("Overzicht producten (bewerkbaar • autosave)")
 
-    # Altijd buffer verversen uit merge (zodat 'Inkomende zending' meteen klopt)
+    # Buffer verversen uit merge (zodat de inkomende zending + ETA kloppen)
     st.session_state.last_inventory_df = merged_inventory(prices_df=st.session_state.prices_df)
     inv_buffer = st.session_state.last_inventory_df.copy()
 
     INV_COLS = [
         "EAN","Referentie","Titel","Vrije voorraad",
-        "Verkoopprognose min (Totaal 4w)","Voorraad dagen","Inkomende zending",
+        "Verkoopprognose min (Totaal 4w)","Voorraad dagen",
+        "Inkomende zending","ETA (verwachte datum)",
         "Verkoopprijs","Inkoopprijs","Verzendkosten","Overige kosten","Leverancier","MOQ","Levertijd (dagen)"
     ]
     for c in INV_COLS:
         if c not in inv_buffer.columns:
-            inv_buffer[c] = "" if c in ["Referentie","Titel","Leverancier"] else (np.nan if c in ["Voorraad dagen"] else 0)
+            inv_buffer[c] = "" if c in ["Referentie","Titel","Leverancier"] else (np.nan if c in ["Voorraad dagen","ETA (verwachte datum)"] else 0)
     inv_view = inv_buffer[INV_COLS].copy()
 
     options = [""] + sorted(set(load_suppliers().get("Naam", pd.Series(dtype=str)).dropna().astype(str).tolist()))
@@ -564,6 +573,7 @@ elif choice == "Inventory":
         "Verkoopprognose min (Totaal 4w)": st.column_config.NumberColumn(step=1, min_value=0),
         "Voorraad dagen": st.column_config.NumberColumn(step=1, disabled=True),
         "Inkomende zending": st.column_config.NumberColumn(step=1, disabled=True),
+        "ETA (verwachte datum)": st.column_config.DateColumn(disabled=True),
         "Verkoopprijs": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.01),
         "Inkoopprijs": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.01),
         "Verzendkosten": st.column_config.NumberColumn(format="%.2f", min_value=0.0, step=0.01),
@@ -591,8 +601,9 @@ elif choice == "Inventory":
     edited["Referentie"] = edited["Referentie"].astype(str).str.strip()
     edited["Titel"] = edited["Titel"].astype(str).str.strip()
     edited["Leverancier"] = edited["Leverancier"].astype(str).str.strip()
-    edited["Voorraad dagen"] = pd.to_numeric(edited["Voorraad dagen"], errors="coerce")  # read-only in UI
-    edited["Inkomende zending"] = pd.to_numeric(edited["Inkomende zending"], errors="coerce").fillna(0).astype(int)  # read-only in UI
+    edited["Voorraad dagen"] = pd.to_numeric(edited["Voorraad dagen"], errors="coerce")  # read-only
+    # ETA blijft Timestamp/NaT; niets aan doen
+    edited["Inkomende zending"] = pd.to_numeric(edited["Inkomende zending"], errors="coerce").fillna(0).astype(int)
 
     # Buffer bijwerken
     st.session_state.last_inventory_df = edited.copy()
